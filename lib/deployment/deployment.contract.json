@@ -1,0 +1,34 @@
+{
+  "schema": "watchtower.deployment.contract.v3",
+  "platform": "azure-app-service-linux",
+  "containerRegistry": {
+    "mode": "shared-existing",
+    "name": "acrenzolopez01",
+    "loginServer": "acrenzolopez01.azurecr.io",
+    "dedicatedRegistryAllowed": false
+  },
+  "persistentStorage": {
+    "requiredEnv": {
+      "name": "WEBSITES_ENABLE_APP_SERVICE_STORAGE",
+      "value": "true"
+    },
+    "mountPoint": "/home",
+    "dataDirectory": "/home/data",
+    "databasePath": "/home/data/watchtower.db",
+    "backupRoot": "/home/data/backups/watchtower",
+    "journalMode": {
+      "name": "SQLITE_JOURNAL_MODE",
+      "value": "DELETE"
+    }
+  },
+  "evidence": {
+    "deploymentProfile": "sqlite-one-worker",
+    "dataStorageMode": "persistent",
+    "numberOfWorkers": 1,
+    "alwaysOn": true,
+    "containerPort": 3000,
+    "healthCheckPath": "/api/live",
+    "readinessPath": "/api/ready",
+    "forbiddenImageVolumePrefix": "/home"
+  }
+}

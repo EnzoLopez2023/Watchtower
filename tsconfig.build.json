@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.build.tsbuildinfo"
+  },
+  "include": ["agents/**/*.ts", "server/**/*.ts", "lib/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["dist", "dist-server", "node_modules", "test"]
+}

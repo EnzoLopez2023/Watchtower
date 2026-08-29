@@ -1,0 +1,16 @@
+node_modules/
+dist/
+dist-server/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+backups/
+.scratch/
+.impeccable/
+.DS_Store
