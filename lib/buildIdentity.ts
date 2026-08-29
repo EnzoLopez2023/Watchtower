@@ -1,0 +1,23 @@
+export const BUILD_IDENTITY = Object.freeze({
+  app: "watchtower",
+  version: "1.0.0",
+  source: Object.freeze({
+    app: "hearth",
+    version: "2.13.2",
+    build: 172,
+    commit: "f0b05fc1dbf53e8aa26c215d8e858894a2793871",
+    tree: "62cbd35861c511f7c17187c875d19ee6e353b80d",
+    imageDigest:
+      "sha256:dc4df7e0f966be5b0608e71643d316cc5eba7590b8e56cec482583ab69443140",
+    database: Object.freeze({
+      backupCreatedUtc: "2026-08-28T05:36:25.317Z",
+      bytes: 950947840,
+      sha256: "dc9fb47d269b339a3dcae37279dc3116f37a0635728a2d2b2ac2c511811a5807",
+      ownedTables: 54,
+      ownedRows: 2723313,
+      canonicalHash: "f2c0030206288ec8314b64eb36ff1943a18f7d1c9cd2ae62b3a330da51be9322"
+    })
+  })
+});
+
+export type BuildIdentity = typeof BUILD_IDENTITY;
