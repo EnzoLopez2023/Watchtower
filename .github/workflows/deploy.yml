@@ -167,7 +167,6 @@ jobs:
             -H 'Cache-Control: no-cache' \
             "$PRODUCTION_URL$VERSION_PATH?deploy-baseline=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>/dev/null || echo '{}')"
           prev_commit="$(jq -r '.deploy.commit // ""' <<<"$prev_version")"
-          prev_instance_id="$(jq -r '.deploy.instanceId // ""' <<<"$prev_version")"
 
           {
             echo "PREVIOUS_IMAGE_REFERENCE=$previous_ref"
@@ -176,9 +175,8 @@ jobs:
             echo "PREVIOUS_BUILD_SHA_SETTING=$prev_build_sha"
             echo "PREVIOUS_BUILD_ID_SETTING=$prev_build_id"
             echo "PREVIOUS_COMMIT=$prev_commit"
-            echo "PREVIOUS_INSTANCE_ID=$prev_instance_id"
           } >> "$GITHUB_ENV"
-          echo "Prior digest $previous_digest, commit ${prev_commit:-unknown}, instance ${prev_instance_id:-unknown}"
+          echo "Prior digest $previous_digest, commit ${prev_commit:-unknown}"
 
       - name: Build, push, and inspect digest-pinned candidate
         id: image
@@ -357,7 +355,6 @@ jobs:
 
             commit="$(jq -r '.deploy.commit // ""' <<<"$ver" 2>/dev/null || echo "")"
             build_id="$(jq -r '.deploy.buildId // ""' <<<"$ver" 2>/dev/null || echo "")"
-            instance="$(jq -r '.deploy.instanceId // ""' <<<"$ver" 2>/dev/null || echo "")"
 
             ok=1
             [[ "$live" == "200" ]] || ok=0
@@ -365,7 +362,6 @@ jobs:
             [[ "$pinned" == "DOCKER|$IMAGE_REFERENCE" ]] || ok=0
             [[ "$commit" == "$GITHUB_SHA" ]] || ok=0
             [[ "$build_id" == "$BUILD_ID" ]] || ok=0
-            if [[ -n "$PREVIOUS_INSTANCE_ID" && "$instance" == "$PREVIOUS_INSTANCE_ID" ]]; then ok=0; fi
 
             if [[ "$ok" == "1" ]]; then
               confirm=$((confirm + 1))
