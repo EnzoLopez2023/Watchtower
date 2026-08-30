@@ -38,9 +38,15 @@ import {
   PAGE_GUTTER,
   SIDEBAR_RESERVE,
   SIDEBAR_WIDTH,
-  cardShadow,
   pageShellSx,
 } from '../theme/controls';
+import {
+  IOS_HOVER_TRANSITION,
+  IOS_SHEET_RADIUS,
+  IOS_SQUIRCLE_SM,
+  iosGlass,
+  iosHoverLayer,
+} from '../theme/ios';
 import { withAlpha } from '../theme/contrast';
 import { DegradedBanner, ErrorState, LoadingState } from '../components/StateBlocks';
 import ReadOnlyNotice from '../components/ReadOnlyNotice';
@@ -138,7 +144,8 @@ function NavItem({
         gap: 1.25,
         px: 1.25,
         py: 0.85,
-        borderRadius: '10px',
+        // iOS squircle geometry on every nav row.
+        borderRadius: IOS_SQUIRCLE_SM,
         textDecoration: 'none',
         color: active ? t.ink : t.inkSoft,
         fontWeight: active ? 800 : 600,
@@ -146,8 +153,10 @@ function NavItem({
         bgcolor: active ? withAlpha(t.rust, isDark ? 0.22 : 0.16) : 'transparent',
         // A left rule marks the active item without relying on colour alone.
         boxShadow: active ? `inset 3px 0 0 ${t.rust}` : 'none',
-        transition: 'background-color 140ms ease, color 140ms ease',
-        '&:hover': { bgcolor: withAlpha(t.rust, isDark ? 0.14 : 0.09), color: t.ink },
+        // Apple-style natural timing; the row lifts to an elevated translucent
+        // glass-on-glass layer on hover rather than tinting with the accent.
+        transition: `${IOS_HOVER_TRANSITION}, color 0.2s ease-in-out`,
+        '&:hover': { bgcolor: iosHoverLayer(isDark), color: t.ink },
         '@media (prefers-reduced-motion: reduce)': { transition: 'none' },
       }}
     >
@@ -328,10 +337,10 @@ export default function AppShell() {
             bottom: PAGE_GUTTER,
             width: SIDEBAR_WIDTH,
             zIndex: 1100,
-            bgcolor: t.paper,
-            border: `1px solid ${t.line}`,
-            borderRadius: '22px',
-            boxShadow: cardShadow(isDark),
+            // Frosted-glass navigation rail — 20px hardware-accelerated blur,
+            // theme-tinted translucency and a hairline glass border.
+            ...iosGlass(t, isDark),
+            borderRadius: IOS_SHEET_RADIUS,
             overflow: 'hidden',
           }}
         >
@@ -352,8 +361,11 @@ export default function AppShell() {
               display: 'flex',
               alignItems: 'center',
               gap: 1,
-              bgcolor: t.paper,
-              borderBottom: `1px solid ${t.line}`,
+              // Same frosted glass as the rail, squared off as a top bar.
+              ...iosGlass(t, isDark),
+              border: 'none',
+              borderRadius: 0,
+              borderBottom: `1px solid ${withAlpha(t.line, 0.6)}`,
             }}
           >
             <IconButton
@@ -374,7 +386,17 @@ export default function AppShell() {
           <Drawer
             open={drawerOpen}
             onClose={closeDrawer}
-            slotProps={{ paper: { sx: { width: SIDEBAR_WIDTH + 40, bgcolor: t.paper } } }}
+            slotProps={{
+              paper: {
+                sx: {
+                  width: SIDEBAR_WIDTH + 40,
+                  ...iosGlass(t, isDark),
+                  borderRadius: 0,
+                  borderTopRightRadius: IOS_SHEET_RADIUS,
+                  borderBottomRightRadius: IOS_SHEET_RADIUS,
+                },
+              },
+            }}
           >
             {railContent}
           </Drawer>

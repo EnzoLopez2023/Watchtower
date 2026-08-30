@@ -20,6 +20,7 @@ import type { AppView } from '../types/AppView';
 import { tokensFor, type PaletteName } from '../theme/tokens';
 import { paletteGradients } from '../theme/palettes';
 import { CARD_RADIUS, SHAPE_BORDER_RADIUS, cardShadow, cardShadowHover } from '../theme/controls';
+import { IOS_MODE, IOS_SQUIRCLE, iosGlass } from '../theme/ios';
 import {
   DEFAULT_APPEARANCE,
   loadAppearance,
@@ -85,6 +86,11 @@ export function usePalette(p: PaletteName) {
 function buildTheme(mode: Mode, palette: PaletteName, view: AppView | null) {
   const isDark = mode === 'dark';
   const t = tokensFor(isDark, palette);
+  // The whole app is pinned to the iOS visual mode. This is the MUI equivalent
+  // of `setupIonicReact({ mode: 'ios' })`: `IOS_MODE` is the single switch, and
+  // it drives the squircle corner scale here plus the frosted-glass surfaces in
+  // the shell (src/theme/ios.ts, src/app/AppShell.tsx).
+  void IOS_MODE;
   const g = paletteGradients(palette, isDark, view ?? undefined);
   const { font } = resolveAppearance(isDark, view, palette);
   ensureFontLoaded(font.id);
@@ -277,6 +283,16 @@ function buildTheme(mode: Mode, palette: PaletteName, view: AppView | null) {
             fontSize: '0.78rem',
             backgroundColor: isDark ? t.paper : t.inkSoft,
             color: isDark ? t.ink : t.paper,
+          },
+        },
+      },
+      // iOS-style context menus: squircle corners over frosted glass.
+      MuiMenu: {
+        styleOverrides: {
+          paper: {
+            ...iosGlass(t, isDark),
+            borderRadius: IOS_SQUIRCLE,
+            backgroundImage: 'none',
           },
         },
       },
