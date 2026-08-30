@@ -118,7 +118,7 @@ export async function acquireApiToken(): Promise<TokenResult> {
 
 const TOKEN_FAILURE_MESSAGE: Record<NonNullable<TokenResult['reason']>, string> = {
   not_configured:
-    'Watchtower is not configured for sign-in. Set VITE_ENTRA_TENANT_ID, VITE_ENTRA_CLIENT_ID and VITE_ENTRA_API_SCOPE.',
+    'Watchtower is not configured for sign-in. Check the AZURE_AD_* App Service settings and runtime-config.js.',
   no_account: 'You are signed out. Sign in again to load this data.',
   interaction_required: 'Your session expired. Completing sign-in…',
   failed: 'Could not acquire a Watchtower API token.',

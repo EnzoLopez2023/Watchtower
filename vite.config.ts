@@ -11,8 +11,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": "http://localhost:3000",
+      "/runtime-config.js": "http://localhost:3000",
       "/version.json": "http://localhost:3000"
     }
   }
 });
-

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import type { RequestHandler } from "express";
@@ -37,11 +37,15 @@ interface Harness {
 
 function createHarness(
   roles: readonly AppRole[] | null,
-  options: { readonly withClient?: boolean } = {}
+  options: {
+    readonly withClient?: boolean;
+    readonly entra?: Partial<ReturnType<typeof testConfig>["entra"]>;
+  } = {}
 ): Harness {
   const { database, path } = openTestDatabase("spa-shell");
   migrateDatabase(database);
   const config = testConfig({
+    entra: options.entra,
     serviceTokens: { ups: "ups-secret", mobile: "mobile-secret", unifi: "unifi-secret" }
   });
   const container = createWatchtowerContainer(database, config, {
@@ -125,6 +129,44 @@ test("the SPA shell and its assets load without a bearer token", async () => {
   } finally {
     harness.close();
   }
+});
+
+test("browser Entra configuration comes from the unauthenticated runtime contract", async () => {
+  const tenantId = "52188f12-db6b-46c6-88ff-08c802f0ed3b";
+  const clientId = "55bf92db-2cec-4e65-ab0d-71bee90d7494";
+  const harness = createHarness(null, {
+    entra: {
+      tenantId,
+      clientId,
+      audience: `api://${clientId}`,
+      configured: true
+    }
+  });
+  try {
+    await withAppServer(harness.app, async (base) => {
+      const response = await fetch(new URL("/runtime-config.js", base));
+      assert.equal(response.status, 200);
+      assert.match(response.headers.get("content-type") ?? "", /application\/javascript/);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+      assert.equal(
+        await response.text(),
+        `window.__WATCHTOWER_RUNTIME_CONFIG__={"entra":{"tenantId":"${tenantId}","clientId":"${clientId}","apiScope":"api://${clientId}/access_as_user"}};\n`
+      );
+    });
+    assert.equal(harness.authCalls(), 0, "runtime config must load before the browser has a token");
+  } finally {
+    harness.close();
+  }
+});
+
+test("the source shell loads runtime configuration before the application module", () => {
+  const sourceShell = readFileSync(resolve("index.html"), "utf8");
+  const runtimeConfig = sourceShell.indexOf('src="/runtime-config.js"');
+  const applicationModule = sourceShell.indexOf('src="/src/main.tsx"');
+  assert.ok(runtimeConfig >= 0, "the runtime configuration script must be present");
+  assert.ok(applicationModule >= 0, "the application module must be present");
+  assert.ok(runtimeConfig < applicationModule, "runtime configuration must execute before MSAL loads");
 });
 
 test("a missing asset is a 404, not the SPA shell", async () => {

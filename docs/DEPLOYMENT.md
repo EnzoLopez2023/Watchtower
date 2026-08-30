@@ -174,6 +174,19 @@ provision anything.
    not create it on an unverified filesystem. Creating it is a one-time
    deployment/runbook action on the mounted share.
 
+## Browser identity configuration
+
+The browser and API share the production `AZURE_AD_TENANT_ID`,
+`AZURE_AD_CLIENT_ID`, and `AZURE_AD_AUDIENCE` settings. Express emits the public
+browser subset at `/runtime-config.js`; `index.html` loads it before the MSAL
+bundle, and the response is never cached. The delegated browser scope is
+`api://<AZURE_AD_CLIENT_ID>/access_as_user`.
+
+Do not pass `VITE_ENTRA_*` Docker build arguments. Baking identity values into
+the frontend image can leave MSAL targeting a different registration than the
+API after an App Service setting changes, and an omitted build argument produces
+an unusable sign-in page even when the server is configured correctly.
+
 ## Infrastructure-as-code coordination
 
 The infrastructure is **not** in this repository. It is owned by `azure-infra`,

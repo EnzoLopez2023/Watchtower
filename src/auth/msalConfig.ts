@@ -1,16 +1,19 @@
 import { LogLevel, PublicClientApplication, type Configuration } from '@azure/msal-browser';
 
 /**
- * Entra configuration, read from the Vite environment at build time.
+ * Entra configuration, supplied by the same runtime settings as the API.
  *
- * Nothing is hard-coded: a deployment supplies VITE_ENTRA_TENANT_ID,
- * VITE_ENTRA_CLIENT_ID and VITE_ENTRA_API_SCOPE. When any of them is missing the
- * app renders a visible configuration error rather than silently signing
- * everyone out or, worse, pretending to be signed in.
+ * `/runtime-config.js` runs before this module and publishes the public tenant,
+ * client and delegated scope. Keeping them out of the Vite build means changing
+ * an App Service setting cannot leave the browser and API on different identity
+ * contracts. When any value is missing the app renders a visible configuration
+ * error rather than silently signing everyone out.
  */
-export const ENTRA_TENANT_ID = import.meta.env.VITE_ENTRA_TENANT_ID ?? '';
-export const ENTRA_CLIENT_ID = import.meta.env.VITE_ENTRA_CLIENT_ID ?? '';
-export const ENTRA_API_SCOPE = import.meta.env.VITE_ENTRA_API_SCOPE ?? '';
+const runtimeEntra = window.__WATCHTOWER_RUNTIME_CONFIG__?.entra;
+
+export const ENTRA_TENANT_ID = runtimeEntra?.tenantId ?? '';
+export const ENTRA_CLIENT_ID = runtimeEntra?.clientId ?? '';
+export const ENTRA_API_SCOPE = runtimeEntra?.apiScope ?? '';
 
 export interface EntraConfigProblem {
   readonly variable: string;
@@ -21,15 +24,15 @@ export interface EntraConfigProblem {
 export function entraConfigProblems(): EntraConfigProblem[] {
   const problems: EntraConfigProblem[] = [];
   if (!ENTRA_TENANT_ID) {
-    problems.push({ variable: 'VITE_ENTRA_TENANT_ID', detail: 'Entra tenant id is not set.' });
+    problems.push({ variable: 'AZURE_AD_TENANT_ID', detail: 'Entra tenant id is not available.' });
   }
   if (!ENTRA_CLIENT_ID) {
-    problems.push({ variable: 'VITE_ENTRA_CLIENT_ID', detail: 'Entra application id is not set.' });
+    problems.push({ variable: 'AZURE_AD_CLIENT_ID', detail: 'Entra application id is not available.' });
   }
   if (!ENTRA_API_SCOPE) {
     problems.push({
-      variable: 'VITE_ENTRA_API_SCOPE',
-      detail: 'Watchtower API scope is not set, so no access token can be requested.',
+      variable: 'runtime-config.js',
+      detail: 'Watchtower API scope is not available, so no access token can be requested.',
     });
   }
   return problems;

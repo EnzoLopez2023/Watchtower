@@ -12,6 +12,19 @@ import {
 
 /** A path whose last segment carries an extension is a file request, not a view. */
 const ASSET_PATH = /\.[a-z0-9]+$/i;
+const DELEGATED_API_SCOPE = "access_as_user";
+
+function browserRuntimeConfig(config: AppConfig): string {
+  const entra = config.entra.configured
+    ? {
+        tenantId: config.entra.tenantId,
+        clientId: config.entra.clientId,
+        apiScope: `api://${config.entra.clientId}/${DELEGATED_API_SCOPE}`
+      }
+    : { tenantId: "", clientId: "", apiScope: "" };
+
+  return `window.__WATCHTOWER_RUNTIME_CONFIG__=${JSON.stringify({ entra })};\n`;
+}
 
 export interface CreateAppOptions {
   readonly config: AppConfig;
@@ -66,6 +79,15 @@ export function createApp(options: CreateAppOptions): Express {
       credentials: false
     })
   );
+  app.get("/runtime-config.js", (_request, response) => {
+    response
+      .set({
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff"
+      })
+      .type("application/javascript")
+      .send(browserRuntimeConfig(options.config));
+  });
 
   if (options.service) app.use(options.service);
   app.use(express.json({ limit: "2mb", strict: true }));

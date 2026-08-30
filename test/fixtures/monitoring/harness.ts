@@ -109,6 +109,7 @@ export function stubApns(options: StubApnsOptions = {}): StubApns {
 }
 
 export interface TestConfigOverrides {
+  readonly entra?: Partial<AppConfig["entra"]>;
   readonly serviceTokens?: Partial<AppConfig["serviceTokens"]>;
   readonly azure?: Partial<AppConfig["azure"]>;
   readonly monitoringArchive?: Partial<AppConfig["monitoringArchive"]>;
@@ -119,6 +120,7 @@ export function testConfig(overrides: TestConfigOverrides = {}): AppConfig {
   const base = loadConfig({ NODE_ENV: "test", DB_PATH: "./.scratch/wt/tmp/config.db" });
   return {
     ...base,
+    entra: { ...base.entra, ...overrides.entra },
     serviceTokens: { ...base.serviceTokens, ...overrides.serviceTokens },
     azure: { ...base.azure, ...overrides.azure },
     monitoringArchive: { ...base.monitoringArchive, ...overrides.monitoringArchive },

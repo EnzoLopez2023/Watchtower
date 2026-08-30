@@ -1,11 +1,11 @@
 /// <reference types="vite/client" />
 
-interface ImportMetaEnv {
-  readonly VITE_ENTRA_TENANT_ID?: string;
-  readonly VITE_ENTRA_CLIENT_ID?: string;
-  readonly VITE_ENTRA_API_SCOPE?: string;
-}
-
-interface ImportMeta {
-  readonly env: ImportMetaEnv;
+interface Window {
+  readonly __WATCHTOWER_RUNTIME_CONFIG__?: {
+    readonly entra: {
+      readonly tenantId: string;
+      readonly clientId: string;
+      readonly apiScope: string;
+    };
+  };
 }
