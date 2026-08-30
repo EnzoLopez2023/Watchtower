@@ -14,9 +14,8 @@
 # image, so the release check proves "a healthy container booted on the exact
 # new digest that the web app is now pinned to", not a per-commit string match.
 #
-# One-time setup (Azure, outside this repo):
-#   A GitHub OIDC app registration whose client id goes in AZURE_CLIENT_ID below,
-#   with a federated credential for
+# Azure deployment identity:
+#   github-watchtower-ci, with a federated credential for
 #     repo:EnzoLopez2023/Watchtower:ref:refs/heads/main
 #   and these role assignments:
 #     - AcrPush on registry acrenzolopez01
@@ -61,8 +60,8 @@ env:
   VERSION_PATH: /api/version
 
   # Watchtower's own GitHub OIDC deploy identity. Shared tenant + subscription
-  # with the sibling apps; the client id is app-specific — see the setup note above.
-  AZURE_CLIENT_ID: REPLACE_WITH_WATCHTOWER_OIDC_CLIENT_ID
+  # with the sibling apps; the client id is app-specific.
+  AZURE_CLIENT_ID: 74d75555-da5f-499d-97b2-6f7daea0166f
   AZURE_TENANT_ID: de625678-c55b-4494-9558-14946cbb6133
   AZURE_SUBSCRIPTION_ID: 1cf02211-8d77-4658-bb6a-0f83ec831c3b
 
