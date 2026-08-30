@@ -16,7 +16,7 @@
 #
 # Azure deployment identity:
 #   github-watchtower-ci, with a federated credential for
-#     repo:EnzoLopez2023/Watchtower:ref:refs/heads/main
+#     repo:EnzoLopez2023@123000731/Watchtower@1349806476:ref:refs/heads/main
 #   and these role assignments:
 #     - AcrPush on registry acrenzolopez01
 #     - Website Contributor (or Contributor) on web app app-watchtower-prod-...
