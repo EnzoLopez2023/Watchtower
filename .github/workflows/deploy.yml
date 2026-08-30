@@ -159,12 +159,27 @@ jobs:
             --image "$IMAGE_REPOSITORY:latest" --query digest --output tsv 2>/dev/null || true)"
           [[ "$previous_latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || previous_latest_digest="$previous_digest"
 
+          prev_settings="$(az webapp config appsettings list \
+            --resource-group "$RG" --name "$WEBAPP" --output json)"
+          prev_build_sha="$(jq -r '(map({(.name): .value}) | add).BUILD_SHA // ""' <<<"$prev_settings")"
+          prev_build_id="$(jq -r '(map({(.name): .value}) | add).BUILD_ID // ""' <<<"$prev_settings")"
+
+          prev_version="$(curl -fsS --max-time "$HTTP_TIMEOUT_SECONDS" \
+            -H 'Cache-Control: no-cache' \
+            "$PRODUCTION_URL$VERSION_PATH?deploy-baseline=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>/dev/null || echo '{}')"
+          prev_commit="$(jq -r '.deploy.commit // ""' <<<"$prev_version")"
+          prev_instance_id="$(jq -r '.deploy.instanceId // ""' <<<"$prev_version")"
+
           {
             echo "PREVIOUS_IMAGE_REFERENCE=$previous_ref"
             echo "PREVIOUS_IMAGE_DIGEST=$previous_digest"
             echo "PREVIOUS_LATEST_DIGEST=$previous_latest_digest"
+            echo "PREVIOUS_BUILD_SHA_SETTING=$prev_build_sha"
+            echo "PREVIOUS_BUILD_ID_SETTING=$prev_build_id"
+            echo "PREVIOUS_COMMIT=$prev_commit"
+            echo "PREVIOUS_INSTANCE_ID=$prev_instance_id"
           } >> "$GITHUB_ENV"
-          echo "Prior digest $previous_digest"
+          echo "Prior digest $previous_digest, commit ${prev_commit:-unknown}, instance ${prev_instance_id:-unknown}"
 
       - name: Build, push, and inspect digest-pinned candidate
         id: image
@@ -319,6 +334,10 @@ jobs:
           [[ "$(az webapp config show --resource-group "$RG" --name "$WEBAPP" \
             --query linuxFxVersion --output tsv)" == "DOCKER|$IMAGE_REFERENCE" ]]
 
+          # /api/version echoes these back as .deploy.commit / .deploy.buildId.
+          az webapp config appsettings set --resource-group "$RG" --name "$WEBAPP" \
+            --settings "BUILD_SHA=$GITHUB_SHA" "BUILD_ID=$BUILD_ID" --output none
+
           az webapp start --resource-group "$RG" --name "$WEBAPP" --output none
 
       - name: Verify the new digest is the live release
@@ -332,20 +351,29 @@ jobs:
               "$PRODUCTION_URL$LIVE_PATH?probe=$nonce" 2>/dev/null || true)"
             ready="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
               "$PRODUCTION_URL$READY_PATH?probe=$nonce" 2>/dev/null || echo '{}')"
+            ver="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
+              "$PRODUCTION_URL$VERSION_PATH?probe=$nonce" 2>/dev/null || echo '{}')"
             pinned="$(az webapp config show --resource-group "$RG" --name "$WEBAPP" \
               --query linuxFxVersion --output tsv 2>/dev/null || true)"
+
+            commit="$(jq -r '.deploy.commit // ""' <<<"$ver" 2>/dev/null || echo "")"
+            build_id="$(jq -r '.deploy.buildId // ""' <<<"$ver" 2>/dev/null || echo "")"
+            instance="$(jq -r '.deploy.instanceId // ""' <<<"$ver" 2>/dev/null || echo "")"
 
             ok=1
             [[ "$live" == "200" ]] || ok=0
             jq -e '.ok == true' <<<"$ready" > /dev/null 2>&1 || ok=0
             [[ "$pinned" == "DOCKER|$IMAGE_REFERENCE" ]] || ok=0
+            [[ "$commit" == "$GITHUB_SHA" ]] || ok=0
+            [[ "$build_id" == "$BUILD_ID" ]] || ok=0
+            if [[ -n "$PREVIOUS_INSTANCE_ID" && "$instance" == "$PREVIOUS_INSTANCE_ID" ]]; then ok=0; fi
 
             if [[ "$ok" == "1" ]]; then
               confirm=$((confirm + 1))
               echo "exact confirmation $confirm/$REQUIRED_CONFIRMATIONS (attempt $attempt)"
               [[ "$confirm" -ge "$REQUIRED_CONFIRMATIONS" ]] && break
             else
-              [[ "$confirm" -gt 0 ]] && echo "streak reset at attempt $attempt (live=$live pinned=${pinned:-none})"
+              [[ "$confirm" -gt 0 ]] && echo "streak reset at attempt $attempt (live=$live commit=${commit:-none} buildId=${build_id:-none} pinned=${pinned:-none})"
               confirm=0
             fi
             sleep "$POLL_INTERVAL_SECONDS"
@@ -364,6 +392,23 @@ jobs:
           docker push "$latest"
           [[ "$(az acr repository show --name "$ACR" --image "$IMAGE_REPOSITORY:latest" \
             --query digest --output tsv)" == "$IMAGE_DIGEST" ]]
+
+      - name: Confirm promoted release
+        shell: bash
+        run: |
+          set -euo pipefail
+          confirm=0
+          for attempt in $(seq 1 12); do
+            ver="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
+              "$PRODUCTION_URL$VERSION_PATH?promoted=$GITHUB_RUN_ID-$attempt" 2>/dev/null || echo '{}')"
+            if [[ "$(jq -r '.deploy.commit // ""' <<<"$ver")" == "$GITHUB_SHA" ]]; then
+              confirm=$((confirm + 1)); [[ "$confirm" -ge "$REQUIRED_CONFIRMATIONS" ]] && break
+            else
+              confirm=0
+            fi
+            sleep "$POLL_INTERVAL_SECONDS"
+          done
+          [[ "$confirm" -ge "$REQUIRED_CONFIRMATIONS" ]]
 
       - name: Record deployment evidence
         shell: bash
@@ -413,6 +458,10 @@ jobs:
               --container-image-name "$PREVIOUS_IMAGE_REFERENCE" \
               --container-registry-url "https://$ACR_LOGIN_SERVER" --output none
           fi
+          if [[ -n "$PREVIOUS_BUILD_SHA_SETTING" && -n "$PREVIOUS_BUILD_ID_SETTING" ]]; then
+            az webapp config appsettings set --resource-group "$RG" --name "$WEBAPP" \
+              --settings "BUILD_SHA=$PREVIOUS_BUILD_SHA_SETTING" "BUILD_ID=$PREVIOUS_BUILD_ID_SETTING" --output none
+          fi
           az webapp start --resource-group "$RG" --name "$WEBAPP" --output none
 
           if [[ "$PREVIOUS_LATEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -429,12 +478,16 @@ jobs:
               "$PRODUCTION_URL$LIVE_PATH?rollback-proof=$GITHUB_RUN_ID-$attempt" 2>/dev/null || true)"
             ready="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
               "$PRODUCTION_URL$READY_PATH?rollback-proof=$GITHUB_RUN_ID-$attempt" 2>/dev/null || echo '{}')"
+            ver="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
+              "$PRODUCTION_URL$VERSION_PATH?rollback-proof=$GITHUB_RUN_ID-$attempt" 2>/dev/null || echo '{}')"
             pinned="$(az webapp config show --resource-group "$RG" --name "$WEBAPP" \
               --query linuxFxVersion --output tsv 2>/dev/null || true)"
+            commit="$(jq -r '.deploy.commit // ""' <<<"$ver")"
             match=1
             [[ "$live" == "200" ]] || match=0
             jq -e '.ok == true' <<<"$ready" > /dev/null 2>&1 || match=0
             [[ "$pinned" == "DOCKER|$PREVIOUS_IMAGE_REFERENCE" ]] || match=0
+            if [[ -n "$PREVIOUS_COMMIT" && "$commit" != "$PREVIOUS_COMMIT" ]]; then match=0; fi
             if [[ "$match" == "1" ]]; then
               restored=$((restored + 1)); [[ "$restored" -ge 3 ]] && break
             else
@@ -446,7 +499,8 @@ jobs:
 
           jq -n \
             --arg image "$PREVIOUS_IMAGE_REFERENCE" \
-            '{rollbackPerformed: true, restoredImage: $image}' \
+            --arg commit "$PREVIOUS_COMMIT" \
+            '{rollbackPerformed: true, restoredImage: $image, restoredCommit: $commit}' \
             > evidence/rollback.json
 
       - name: Upload nonsecret deployment evidence

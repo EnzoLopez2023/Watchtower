@@ -10,6 +10,21 @@ import type { SettingsRepository } from "../../lib/db/repositories/settingsRepos
 import { requireRole } from "../auth/authorize.js";
 import { HttpError } from "../http/errors.js";
 
+/**
+ * Runtime deployment identity, distinct from the baked-in BUILD_IDENTITY.
+ *
+ * The deploy workflow (.github/workflows/deploy.yml) writes BUILD_SHA and
+ * BUILD_ID as App Service settings for the exact image it just pushed, and
+ * WEBSITE_INSTANCE_ID is supplied by the platform. `/api/version` echoes them so
+ * the workflow can confirm the running container is the one it deployed. All
+ * three are null in local/dev and CI, where the check does not run.
+ */
+const DEPLOY_IDENTITY = Object.freeze({
+  commit: process.env.BUILD_SHA?.trim() || null,
+  buildId: process.env.BUILD_ID?.trim() || null,
+  instanceId: process.env.WEBSITE_INSTANCE_ID?.trim() || null
+});
+
 export interface LifecycleState {
   readonly state: "starting" | "ready" | "draining" | "stopped";
 }
@@ -77,7 +92,9 @@ export function createPublicCoreRouter(dependencies: CoreRouteDependencies): Rou
     });
   });
 
-  router.get("/api/version", (_request, response) => response.json(BUILD_IDENTITY));
+  router.get("/api/version", (_request, response) =>
+    response.json({ ...BUILD_IDENTITY, deploy: DEPLOY_IDENTITY })
+  );
   router.get("/version.json", (_request, response) => response.json(BUILD_IDENTITY));
 
   router.get("/api/ready", async (_request, response) => {
