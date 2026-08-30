@@ -1,0 +1,459 @@
+# Build, attest, and deploy Watchtower to Azure — one action, every push to main.
+#
+# Flow: source gates (typecheck / lint / test / build / no-postgres) -> prod
+# dependency audit + source SBOM -> docker build a digest-pinned candidate and
+# push it to the shared ACR -> exact-image SBOM + Trivy scan (evidence) ->
+# cosign keyless sign + SLSA provenance attestation + SBOM attestation + verify
+# -> arm rollback -> stop the web app / repin the container to the exact digest
+# / start -> poll /api/live + /api/ready and confirm the web app is pinned to
+# the new digest for N consecutive checks -> promote :latest. Any failure after
+# the "Arm rollback" step repins the previous digest, restarts, and restores the
+# previous :latest.
+#
+# Watchtower's build identity (/api/version) is a static constant baked into the
+# image, so the release check proves "a healthy container booted on the exact
+# new digest that the web app is now pinned to", not a per-commit string match.
+#
+# One-time setup (Azure, outside this repo):
+#   A GitHub OIDC app registration whose client id goes in AZURE_CLIENT_ID below,
+#   with a federated credential for
+#     repo:EnzoLopez2023/Watchtower:ref:refs/heads/main
+#   and these role assignments:
+#     - AcrPush on registry acrenzolopez01
+#     - Website Contributor (or Contributor) on web app app-watchtower-prod-...
+#
+# Manual rollback (if this workflow itself is broken) — replace <PREV_DIGEST>:
+#   az webapp config container set -g rg-personal-apps-prod \
+#     -n app-watchtower-prod-lwxhu7jxlrbtu \
+#     --container-image-name acrenzolopez01.azurecr.io/watchtower@sha256:<PREV_DIGEST> \
+#     --container-registry-url https://acrenzolopez01.azurecr.io
+#   az webapp restart -g rg-personal-apps-prod -n app-watchtower-prod-lwxhu7jxlrbtu
+
+name: Build, attest, and deploy Watchtower to Azure
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.gitignore'
+      - '.claude/**'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-watchtower
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  RG: rg-personal-apps-prod
+  ACR: acrenzolopez01
+  ACR_LOGIN_SERVER: acrenzolopez01.azurecr.io
+  IMAGE_REPOSITORY: watchtower
+  WEBAPP: app-watchtower-prod-lwxhu7jxlrbtu
+  PRODUCTION_URL: https://app-watchtower-prod-lwxhu7jxlrbtu.azurewebsites.net
+  LIVE_PATH: /api/live
+  READY_PATH: /api/ready
+  VERSION_PATH: /api/version
+
+  # Watchtower's own GitHub OIDC deploy identity. Shared tenant + subscription
+  # with the sibling apps; the client id is app-specific — see the setup note above.
+  AZURE_CLIENT_ID: REPLACE_WITH_WATCHTOWER_OIDC_CLIENT_ID
+  AZURE_TENANT_ID: de625678-c55b-4494-9558-14946cbb6133
+  AZURE_SUBSCRIPTION_ID: 1cf02211-8d77-4658-bb6a-0f83ec831c3b
+
+  REQUIRED_CONFIRMATIONS: '3'
+  MAX_ATTEMPTS: '90'
+  ROLLBACK_MAX_ATTEMPTS: '30'
+  POLL_INTERVAL_SECONDS: '5'
+  HTTP_TIMEOUT_SECONDS: '8'
+  DEPLOYMENT_MUTATED: 'false'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Source, dependency, and SBOM gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run lint
+          npm test
+          npm run build
+          npm run check:no-postgres
+
+          set +e
+          npm audit --omit=dev --audit-level=high --json > evidence/npm-audit.json
+          audit_status=$?
+          set -e
+          jq -e 'type == "object"' evidence/npm-audit.json > /dev/null
+          if [[ "$audit_status" -ne 0 ]]; then
+            echo "::error::Production dependency audit found HIGH or CRITICAL findings"
+            exit "$audit_status"
+          fi
+
+          npm sbom --sbom-format=cyclonedx > evidence/source-sbom.cdx.json
+          jq -e 'type == "object"' evidence/source-sbom.cdx.json > /dev/null
+
+      - name: Azure login with OIDC
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Capture prior release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          config="$(az webapp config show \
+            --resource-group "$RG" --name "$WEBAPP" \
+            --query '{alwaysOn:alwaysOn, workers:numberOfWorkers, image:linuxFxVersion}' \
+            --output json)"
+          jq -e '.alwaysOn == true and .workers == 1 and (.image | startswith("DOCKER|"))' \
+            <<<"$config" > /dev/null
+
+          configured_ref="$(jq -r '.image' <<<"$config")"
+          configured_ref="${configured_ref#DOCKER|}"
+          expected_prefix="$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY"
+          case "$configured_ref" in
+            "$expected_prefix"@sha256:*)
+              previous_ref="$configured_ref"
+              previous_digest="${configured_ref##*@}"
+              ;;
+            "$expected_prefix":*)
+              previous_spec="${configured_ref#"$ACR_LOGIN_SERVER/"}"
+              previous_digest="$(az acr repository show --name "$ACR" \
+                --image "$previous_spec" --query digest --output tsv)"
+              previous_ref="$expected_prefix@$previous_digest"
+              ;;
+            *)
+              echo "::error::Current image is outside $expected_prefix"
+              exit 1
+              ;;
+          esac
+          [[ "$previous_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          previous_latest_digest="$(az acr repository show --name "$ACR" \
+            --image "$IMAGE_REPOSITORY:latest" --query digest --output tsv 2>/dev/null || true)"
+          [[ "$previous_latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || previous_latest_digest="$previous_digest"
+
+          {
+            echo "PREVIOUS_IMAGE_REFERENCE=$previous_ref"
+            echo "PREVIOUS_IMAGE_DIGEST=$previous_digest"
+            echo "PREVIOUS_LATEST_DIGEST=$previous_latest_digest"
+          } >> "$GITHUB_ENV"
+          echo "Prior digest $previous_digest"
+
+      - name: Build, push, and inspect digest-pinned candidate
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_ID="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          repo="$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY"
+          candidate_tag="$repo:$GITHUB_SHA-$BUILD_ID"
+
+          # The deploy identity holds AcrPush but not the registry-Contributor
+          # role az acr build / az acr import need, so the image is built on the
+          # runner and pushed with docker. Identity is configured at runtime via
+          # /runtime-config.js, so no VITE_* build args are passed (see docs/DEPLOYMENT.md).
+          az acr login --name "$ACR"
+          docker build \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$BUILD_ID" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --tag "$candidate_tag" \
+            .
+          docker push "$candidate_tag"
+
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$candidate_tag" | sed 's/.*@//')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            digest="$(az acr repository show --name "$ACR" \
+              --image "$IMAGE_REPOSITORY:$GITHUB_SHA-$BUILD_ID" --query digest --output tsv)"
+          fi
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          image_ref="$repo@$digest"
+          docker pull "$image_ref"
+
+          # No Docker VOLUME at or under /home: one would mount an anonymous
+          # ephemeral volume that passes every runtime storage probe while
+          # silently discarding the SQLite database on every restart.
+          docker image inspect "$image_ref" --format '{{json .Config.Volumes}}' \
+            | jq -e '[((. // {}) | keys[]) | select(. == "/home" or startswith("/home/"))] | length == 0' > /dev/null
+          [[ "$(docker image inspect "$image_ref" \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" == "$GITHUB_SHA" ]]
+          [[ "$(docker image inspect "$image_ref" \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" == "$BUILD_ID" ]]
+
+          {
+            echo "ref=$image_ref"
+            echo "digest=$digest"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "IMAGE_REFERENCE=$image_ref"
+            echo "IMAGE_DIGEST=$digest"
+            echo "BUILD_ID=$BUILD_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate exact-image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ steps.image.outputs.ref }}
+          format: spdx-json
+          output-file: evidence/image-sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Scan exact image for HIGH and CRITICAL vulnerabilities
+        # Reported as evidence, not gated: a base-image CVE must not wedge a
+        # production deploy. Flip exit-code to '1' to make it blocking.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: json
+          output: evidence/trivy-image.json
+          exit-code: '0'
+          ignore-unfixed: false
+          severity: HIGH,CRITICAL
+          scanners: vuln
+          timeout: 10m
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign and attest exact image
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/deploy.yml@$GITHUB_REF"
+          started_on="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -n \
+            --arg buildType "https://github.com/EnzoLopez2023/azure-infra/blob/main/DEPLOYMENT_RUNBOOK.md" \
+            --arg repository "git+https://github.com/$GITHUB_REPOSITORY" \
+            --arg sha "$GITHUB_SHA" \
+            --arg workflow "$workflow_identity" \
+            --arg invocation "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --arg started "$started_on" \
+            '{
+              buildDefinition: {
+                buildType: $buildType,
+                externalParameters: { repository: $repository, ref: env.GITHUB_REF },
+                internalParameters: { invocationId: $invocation },
+                resolvedDependencies: [{ uri: $repository, digest: { gitCommit: $sha } }]
+              },
+              runDetails: {
+                builder: { id: $workflow },
+                metadata: { invocationId: $invocation, startedOn: $started }
+              }
+            }' > evidence/provenance.slsa.json
+
+          cosign sign --yes "$IMAGE_REFERENCE"
+          cosign attest --yes --predicate evidence/provenance.slsa.json \
+            --type slsaprovenance1 "$IMAGE_REFERENCE"
+          cosign attest --yes --predicate evidence/image-sbom.spdx.json \
+            --type spdxjson "$IMAGE_REFERENCE"
+
+          cosign verify \
+            --certificate-identity "$workflow_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE_REFERENCE" > evidence/cosign-signature.json
+          cosign verify-attestation --type slsaprovenance1 \
+            --certificate-identity "$workflow_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE_REFERENCE" > evidence/cosign-provenance.json
+          cosign verify-attestation --type spdxjson \
+            --certificate-identity "$workflow_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE_REFERENCE" > evidence/cosign-sbom.json
+
+      - name: Arm rollback before production mutation
+        shell: bash
+        run: echo "DEPLOYMENT_MUTATED=true" >> "$GITHUB_ENV"
+
+      - name: Activate inspected digest as production release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az webapp stop --resource-group "$RG" --name "$WEBAPP" --output none
+          absent=0
+          for attempt in $(seq 1 60); do
+            state="$(az webapp show --resource-group "$RG" --name "$WEBAPP" --query state --output tsv)"
+            status="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' \
+              "$PRODUCTION_URL$LIVE_PATH?stop-proof=$GITHUB_RUN_ID-$attempt" 2>/dev/null || true)"
+            if [[ "$state" == "Stopped" && ! "$status" =~ ^2 ]]; then
+              absent=$((absent + 1)); [[ "$absent" -ge 3 ]] && break
+            else
+              absent=0
+            fi
+            sleep 2
+          done
+          [[ "$absent" -ge 3 ]]
+
+          az webapp config container set --resource-group "$RG" --name "$WEBAPP" \
+            --container-image-name "$IMAGE_REFERENCE" \
+            --container-registry-url "https://$ACR_LOGIN_SERVER" --output none
+          [[ "$(az webapp config show --resource-group "$RG" --name "$WEBAPP" \
+            --query linuxFxVersion --output tsv)" == "DOCKER|$IMAGE_REFERENCE" ]]
+
+          az webapp start --resource-group "$RG" --name "$WEBAPP" --output none
+
+      - name: Verify the new digest is the live release
+        shell: bash
+        run: |
+          set -euo pipefail
+          confirm=0
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            nonce="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$attempt"
+            live="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" -o /dev/null -w '%{http_code}' \
+              "$PRODUCTION_URL$LIVE_PATH?probe=$nonce" 2>/dev/null || true)"
+            ready="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
+              "$PRODUCTION_URL$READY_PATH?probe=$nonce" 2>/dev/null || echo '{}')"
+            pinned="$(az webapp config show --resource-group "$RG" --name "$WEBAPP" \
+              --query linuxFxVersion --output tsv 2>/dev/null || true)"
+
+            ok=1
+            [[ "$live" == "200" ]] || ok=0
+            jq -e '.ok == true' <<<"$ready" > /dev/null 2>&1 || ok=0
+            [[ "$pinned" == "DOCKER|$IMAGE_REFERENCE" ]] || ok=0
+
+            if [[ "$ok" == "1" ]]; then
+              confirm=$((confirm + 1))
+              echo "exact confirmation $confirm/$REQUIRED_CONFIRMATIONS (attempt $attempt)"
+              [[ "$confirm" -ge "$REQUIRED_CONFIRMATIONS" ]] && break
+            else
+              [[ "$confirm" -gt 0 ]] && echo "streak reset at attempt $attempt (live=$live pinned=${pinned:-none})"
+              confirm=0
+            fi
+            sleep "$POLL_INTERVAL_SECONDS"
+          done
+          [[ "$confirm" -ge "$REQUIRED_CONFIRMATIONS" ]]
+
+          [[ "$(az acr repository show --name "$ACR" \
+            --image "$IMAGE_REPOSITORY:$GITHUB_SHA-$BUILD_ID" --query digest --output tsv)" == "$IMAGE_DIGEST" ]]
+
+      - name: Promote verified digest to :latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest="$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY:latest"
+          docker tag "$IMAGE_REFERENCE" "$latest"
+          docker push "$latest"
+          [[ "$(az acr repository show --name "$ACR" --image "$IMAGE_REPOSITORY:latest" \
+            --query digest --output tsv)" == "$IMAGE_DIGEST" ]]
+
+      - name: Record deployment evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg sha "$GITHUB_SHA" \
+            --arg buildId "$BUILD_ID" \
+            --arg image "$IMAGE_REFERENCE" \
+            --arg previous "$PREVIOUS_IMAGE_REFERENCE" \
+            --arg run "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            '{sha: $sha, buildId: $buildId, image: $image, previousImage: $previous,
+              workflowRun: $run, confirmations: 3, signed: true, provenanceAttested: true,
+              sbomAttested: true, rollbackPerformed: false}' > evidence/deployment.json
+          {
+            echo "### Watchtower deployed"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Build ID: \`$BUILD_ID\`"
+            echo "- Image: \`$IMAGE_REFERENCE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore prior release after failure or cancellation
+        if: ${{ always() && (failure() || cancelled()) && env.DEPLOYMENT_MUTATED == 'true' }}
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "::warning::Restoring prior Watchtower release $PREVIOUS_IMAGE_REFERENCE"
+
+          az webapp stop --resource-group "$RG" --name "$WEBAPP" --output none
+          absent=0
+          for attempt in $(seq 1 "$ROLLBACK_MAX_ATTEMPTS"); do
+            state="$(az webapp show --resource-group "$RG" --name "$WEBAPP" --query state --output tsv)"
+            status="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' \
+              "$PRODUCTION_URL$LIVE_PATH?rollback-stop=$GITHUB_RUN_ID-$attempt" 2>/dev/null || true)"
+            if [[ "$state" == "Stopped" && ! "$status" =~ ^2 ]]; then
+              absent=$((absent + 1)); [[ "$absent" -ge 3 ]] && break
+            else
+              absent=0
+            fi
+            sleep 2
+          done
+
+          if [[ -n "$PREVIOUS_IMAGE_REFERENCE" ]]; then
+            az webapp config container set --resource-group "$RG" --name "$WEBAPP" \
+              --container-image-name "$PREVIOUS_IMAGE_REFERENCE" \
+              --container-registry-url "https://$ACR_LOGIN_SERVER" --output none
+          fi
+          az webapp start --resource-group "$RG" --name "$WEBAPP" --output none
+
+          if [[ "$PREVIOUS_LATEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            prev_latest="$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY@$PREVIOUS_LATEST_DIGEST"
+            az acr login --name "$ACR" || true
+            docker pull "$prev_latest" \
+              && docker tag "$prev_latest" "$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY:latest" \
+              && docker push "$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY:latest" || true
+          fi
+
+          restored=0
+          for attempt in $(seq 1 "$ROLLBACK_MAX_ATTEMPTS"); do
+            live="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" -o /dev/null -w '%{http_code}' \
+              "$PRODUCTION_URL$LIVE_PATH?rollback-proof=$GITHUB_RUN_ID-$attempt" 2>/dev/null || true)"
+            ready="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
+              "$PRODUCTION_URL$READY_PATH?rollback-proof=$GITHUB_RUN_ID-$attempt" 2>/dev/null || echo '{}')"
+            pinned="$(az webapp config show --resource-group "$RG" --name "$WEBAPP" \
+              --query linuxFxVersion --output tsv 2>/dev/null || true)"
+            match=1
+            [[ "$live" == "200" ]] || match=0
+            jq -e '.ok == true' <<<"$ready" > /dev/null 2>&1 || match=0
+            [[ "$pinned" == "DOCKER|$PREVIOUS_IMAGE_REFERENCE" ]] || match=0
+            if [[ "$match" == "1" ]]; then
+              restored=$((restored + 1)); [[ "$restored" -ge 3 ]] && break
+            else
+              restored=0
+            fi
+            sleep "$POLL_INTERVAL_SECONDS"
+          done
+          [[ "$restored" -ge 3 ]]
+
+          jq -n \
+            --arg image "$PREVIOUS_IMAGE_REFERENCE" \
+            '{rollbackPerformed: true, restoredImage: $image}' \
+            > evidence/rollback.json
+
+      - name: Upload nonsecret deployment evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: deployment-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
