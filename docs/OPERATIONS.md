@@ -38,6 +38,11 @@ run-unique image digest before promotion.
 Startup does not run `quick_check`, `integrity_check`, backup, restore, or
 archive scans. Those are explicit operator commands.
 
+Production startup also rejects any unresolved App Service
+`@Microsoft.KeyVault(...)` reference. Treating that public reference text as a
+token or private key would make a healthy-looking deployment both disconnected
+and incorrectly authenticated.
+
 Optional off-host recovery is enabled only with
 `OFFHOST_BACKUP_ENABLED=true`. Its first pass is delayed until after startup and
 runs database-native backup, local verification, managed-identity upload and

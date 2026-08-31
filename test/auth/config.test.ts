@@ -9,8 +9,6 @@ const PRODUCTION_IDENTITY = {
   AZURE_AD_AUDIENCE: "api://55bf92db-2cec-4e65-ab0d-71bee90d7494",
   ADMIN_OID: "d6c36f6e-054c-45b8-9468-16c208628814",
   MARQUEE_BASE_URL: "https://marquee.example",
-  MARQUEE_TENANT_ID: "52188f12-db6b-46c6-88ff-08c802f0ed3b",
-  MARQUEE_CLIENT_ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   MARQUEE_SCOPE: "api://marquee/.default"
 };
 

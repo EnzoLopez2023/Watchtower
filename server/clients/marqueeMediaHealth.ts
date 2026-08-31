@@ -1,6 +1,6 @@
 import {
   ClientSecretCredential,
-  DefaultAzureCredential,
+  ManagedIdentityCredential,
   type TokenCredential
 } from "@azure/identity";
 import type { AppConfig } from "../config.js";
@@ -218,7 +218,7 @@ export class EntraMediaHealthClient implements MediaHealthClient {
 }
 
 export function createMediaHealthClient(config: AppConfig["marquee"]): MediaHealthClient {
-  if (!config.baseUrl || !config.scope || !config.tenantId || !config.clientId) {
+  if (!config.baseUrl || !config.scope) {
     return {
       async get(): Promise<never> {
         throw new MediaHealthClientError(
@@ -228,9 +228,24 @@ export function createMediaHealthClient(config: AppConfig["marquee"]): MediaHeal
       }
     };
   }
-  const credential: TokenCredential = config.clientSecret
-    ? new ClientSecretCredential(config.tenantId, config.clientId, config.clientSecret)
-    : new DefaultAzureCredential({ managedIdentityClientId: config.clientId });
+  let credential: TokenCredential;
+  if (config.clientSecret) {
+    if (!config.tenantId || !config.clientId) {
+      throw new Error(
+        "MARQUEE_TENANT_ID and MARQUEE_CLIENT_ID are required with MARQUEE_CLIENT_SECRET"
+      );
+    }
+    credential = new ClientSecretCredential(
+      config.tenantId,
+      config.clientId,
+      config.clientSecret
+    );
+  } else {
+    // The production App Service owns a system-assigned identity. Supplying its
+    // client ID here would select the user-assigned identity flow and prevents
+    // token acquisition even though the platform identity is healthy.
+    credential = new ManagedIdentityCredential();
+  }
   return new EntraMediaHealthClient({
     baseUrl: config.baseUrl,
     scope: config.scope,

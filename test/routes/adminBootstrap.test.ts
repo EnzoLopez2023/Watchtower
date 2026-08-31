@@ -24,8 +24,6 @@ const PRODUCTION: NodeJS.ProcessEnv = {
   AZURE_AD_AUDIENCE: "api://watchtower",
   ADMIN_OID: BOOTSTRAP_OID,
   MARQUEE_BASE_URL: "https://marquee.example",
-  MARQUEE_TENANT_ID: TENANT_ID,
-  MARQUEE_CLIENT_ID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
   MARQUEE_SCOPE: "api://marquee/.default"
 };
 
