@@ -88,8 +88,6 @@ test("the app's own config agrees with the declared container port and backup ro
     AZURE_AD_AUDIENCE: "api://watchtower",
     MARQUEE_BASE_URL: "https://marquee.example.com",
     MARQUEE_SCOPE: "api://marquee/.default",
-    MARQUEE_TENANT_ID: "22222222-3333-4444-5555-666666666666",
-    MARQUEE_CLIENT_ID: "44444444-5555-6666-7777-888888888888",
     DB_PATH: STORAGE.databasePath
   });
   assert.equal(config.port, EVIDENCE.containerPort, "PORT must match containerPort");

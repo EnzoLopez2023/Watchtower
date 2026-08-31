@@ -10,6 +10,8 @@ import { SqliteNetworkObserverRepository } from "../../lib/db/repositories/watch
 import { SqliteAgentIngestReceiptRepository, deliveryIdFrom } from "../../lib/db/repositories/watchtower/agentIngestReceiptRepository.js";
 import { createNetworkObserverServiceRouter, createNetworkObserverRouter } from "../../server/routes/features/networkObserver.js";
 import type { NetworkObserverRepository } from "../../lib/db/repositories/watchtower/networkObserverRepository.js";
+import type { UnifiRepository } from "../../lib/db/repositories/watchtower/unifiRepository.js";
+import { packJson } from "../../lib/monitoring/payloadCodec.js";
 import { withAppServer } from "../helpers/appTestServer.js";
 import type { AppConfig } from "../../server/config.js";
 import type { AppIdentity } from "../../lib/db/repositories/identityRepository.js";
@@ -26,6 +28,30 @@ const config = {
   serviceTokens: { networkObserver: "observer-test-token", unifi: "unifi-token" },
 } as unknown as AppConfig;
 
+const unifiRepository = {
+  async getLatestPayload() {
+    return {
+      id: 1,
+      received_at: Date.now(),
+      payload: packJson({
+        devices: [
+          {
+            id: "switch-1",
+            mac: "00:11:22:33:44:55",
+            ip: "192.0.2.10",
+            model: "USW-Pro",
+            name: "Core Switch",
+            type: "usw",
+            serial: "must-not-leak",
+            raw: { secret: "must-not-leak" }
+          }
+        ],
+        clients: [{ name: "must-not-leak" }]
+      })
+    };
+  }
+} satisfies Pick<UnifiRepository, "getLatestPayload">;
+
 function stubViewer(): express.RequestHandler {
   return (_req, res, next) => { res.locals["identity"] = { roles: ["viewer"] } as unknown as AppIdentity; next(); };
 }
@@ -37,7 +63,11 @@ before(() => {
   const repo = new SqliteNetworkObserverRepository(db, receipts);
 
   const app = express();
-  const svcRouter = createNetworkObserverServiceRouter({ config, repository: repo });
+  const svcRouter = createNetworkObserverServiceRouter({
+    config,
+    repository: repo,
+    unifiRepository
+  });
   svcRouter.post("/api/network-observer/ingest", express.json({ limit: "50mb" }), (_req, _res, next) => next());
   app.post("/api/network-observer/ingest", express.json({ limit: "50mb" }));
   app.use(svcRouter);
@@ -109,6 +139,14 @@ async function get(path: string): Promise<Response> {
   return fetch(`${baseUrl}${path}`);
 }
 
+async function serviceGet(path: string, token = "observer-test-token"): Promise<Response> {
+  const headers = new Headers();
+  headers.set("authorization", ["Bearer", token].join(" "));
+  return fetch(`${baseUrl}${path}`, {
+    headers
+  });
+}
+
 // ── Auth matrix ───────────────────────────────────────────────────────────────
 
 test("ingest returns 503 when token is not configured", async () => {
@@ -119,7 +157,13 @@ test("ingest returns 503 when token is not configured", async () => {
   const repo2 = new SqliteNetworkObserverRepository(db2, receipts2);
   const app2 = express();
   app2.use(express.json());
-  app2.use(createNetworkObserverServiceRouter({ config: noTokenConfig, repository: repo2 }));
+  app2.use(
+    createNetworkObserverServiceRouter({
+      config: noTokenConfig,
+      repository: repo2,
+      unifiRepository
+    })
+  );
   const srv2 = await new Promise<Server>((resolve, reject) => {
     const s = app2.listen(0, "127.0.0.1", () => resolve(s));
     s.once("error", reject);
@@ -150,6 +194,60 @@ test("ingest returns 200 with correct token", async () => {
   const body = await res.json() as { ok: boolean; probesStored: number };
   assert.equal(body.ok, true);
   assert.equal(body.probesStored, 1);
+});
+
+test("service-authenticated UniFi discovery exposes only bounded device identity", async () => {
+  assert.equal(
+    (await serviceGet("/api/network-observer/discovery/unifi", "wrong-token")).status,
+    401
+  );
+
+  const response = await serviceGet("/api/network-observer/discovery/unifi");
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as {
+    ok: boolean;
+    present: boolean;
+    stale: boolean;
+    devices: Array<Record<string, unknown>>;
+  };
+  assert.equal(body.ok, true);
+  assert.equal(body.present, true);
+  assert.equal(body.stale, false);
+  assert.deepEqual(body.devices, [
+    {
+      id: "switch-1",
+      mac: "00:11:22:33:44:55",
+      ip: "192.0.2.10",
+      model: "USW-Pro",
+      name: "Core Switch",
+      type: "usw"
+    }
+  ]);
+  assert.doesNotMatch(JSON.stringify(body), /serial|must-not-leak|clients|raw/);
+});
+
+test("UniFi token fallback authorizes Network Observer discovery", async () => {
+  const fallbackConfig = {
+    serviceTokens: { unifi: "unifi-token" }
+  } as unknown as AppConfig;
+  const app = express();
+  app.use(
+    createNetworkObserverServiceRouter({
+      config: fallbackConfig,
+      repository: {} as NetworkObserverRepository,
+      unifiRepository
+    })
+  );
+
+  await withAppServer(app, async (url) => {
+    const headers = new Headers();
+    headers.set("authorization", ["Bearer", "unifi-token"].join(" "));
+    const response = await fetch(
+      new URL("/api/network-observer/discovery/unifi", url),
+      { headers }
+    );
+    assert.equal(response.status, 200);
+  });
 });
 
 // ── Delivery-id idempotency ────────────────────────────────────────────────────
@@ -276,7 +374,7 @@ test("unexpected ingest failures return a secret-safe 500", async () => {
       throw new Error("SQLITE_ERROR: no such column: network_probe_samples.secret_col");
     }
   } as unknown as NetworkObserverRepository;
-  app.use(createNetworkObserverServiceRouter({ config, repository }));
+  app.use(createNetworkObserverServiceRouter({ config, repository, unifiRepository }));
 
   await withAppServer(app, async (base) => {
     const response = await fetch(new URL("/api/network-observer/ingest", base), {

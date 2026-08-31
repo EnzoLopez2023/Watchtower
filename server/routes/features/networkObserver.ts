@@ -6,18 +6,27 @@ import { tokenMatches, bearerToken } from "./serviceAuth.js";
 import { requireRole } from "../../auth/authorize.js";
 import type { AppConfig } from "../../config.js";
 import type { NetworkObserverRepository } from "../../../lib/db/repositories/watchtower/networkObserverRepository.js";
+import type { UnifiRepository } from "../../../lib/db/repositories/watchtower/unifiRepository.js";
 import { RANGES } from "../../../lib/db/repositories/watchtower/networkObserverRepository.js";
+import { unpackJson } from "../../../lib/monitoring/payloadCodec.js";
 import { asText } from "../../../lib/monitoring/values.js";
 import { asyncHandler, serverError } from "./http.js";
 
 export interface NetworkObserverServiceRouterDependencies {
   readonly config: AppConfig;
   readonly repository: NetworkObserverRepository;
+  readonly unifiRepository: Pick<UnifiRepository, "getLatestPayload">;
 }
 
 export interface NetworkObserverRouterDependencies {
   readonly config: AppConfig;
   readonly repository: NetworkObserverRepository;
+}
+
+const MAX_DISCOVERY_DEVICES = 512;
+
+function optionalText(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 export function createNetworkObserverServiceRouter(deps: NetworkObserverServiceRouterDependencies): Router {
@@ -37,6 +46,48 @@ export function createNetworkObserverServiceRouter(deps: NetworkObserverServiceR
     }
     next();
   };
+
+  router.get(
+    "/api/network-observer/discovery/unifi",
+    authenticate,
+    asyncHandler(async (_req: Request, res: Response) => {
+      const row = await deps.unifiRepository.getLatestPayload();
+      if (!row) {
+        res.json({
+          ok: true,
+          present: false,
+          last_contact_at: null,
+          stale: true,
+          devices: []
+        });
+        return;
+      }
+      const payload = unpackJson<Record<string, unknown>>(row.payload);
+      if (!payload) throw new Error("UniFi discovery snapshot is unreadable");
+      const sourceDevices = Array.isArray(payload.devices) ? payload.devices : [];
+      const devices = sourceDevices
+        .filter(
+          (value): value is Record<string, unknown> =>
+            typeof value === "object" && value !== null && !Array.isArray(value)
+        )
+        .slice(0, MAX_DISCOVERY_DEVICES)
+        .map((device) => ({
+          id: optionalText(device.id),
+          mac: optionalText(device.mac),
+          ip: optionalText(device.ip),
+          model: optionalText(device.model),
+          name: optionalText(device.name),
+          type: optionalText(device.type)
+        }));
+      res.json({
+        ok: true,
+        present: true,
+        last_contact_at: row.received_at,
+        stale: Date.now() - row.received_at > AGENT_FRESHNESS.unifi.staleAfterMs,
+        devices
+      });
+    })
+  );
 
   router.post("/api/network-observer/ingest", authenticate, express.json({ limit: "50mb" }), asyncHandler(async (req: Request, res: Response) => {
     if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {

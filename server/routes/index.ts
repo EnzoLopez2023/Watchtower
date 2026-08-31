@@ -71,6 +71,7 @@ export function createFeatureRouters(container: WatchtowerContainer): FeatureRou
     createNetworkObserverServiceRouter({
       config,
       repository: repositories.networkObserver,
+      unifiRepository: repositories.unifi,
     })
   );
   service.use(

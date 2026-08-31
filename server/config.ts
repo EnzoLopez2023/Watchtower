@@ -101,10 +101,23 @@ export interface AppConfig {
 
 const GUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const KEY_VAULT_REFERENCE_PATTERN = /^\s*@Microsoft\.KeyVault\(/i;
 
 function optional(env: NodeJS.ProcessEnv, key: string): string | undefined {
   const value = env[key]?.trim();
   return value ? value : undefined;
+}
+
+function rejectUnresolvedKeyVaultReferences(env: NodeJS.ProcessEnv): void {
+  const unresolved = Object.entries(env)
+    .filter(([, value]) => value !== undefined && KEY_VAULT_REFERENCE_PATTERN.test(value))
+    .map(([key]) => key)
+    .sort();
+  if (unresolved.length > 0) {
+    throw new Error(
+      `Unresolved Azure Key Vault references: ${unresolved.join(", ")}`
+    );
+  }
 }
 
 function parseInteger(
@@ -223,6 +236,7 @@ function rejectStaticCredentials(env: NodeJS.ProcessEnv): void {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const environment = parseEnvironment(optional(env, "NODE_ENV"));
+  if (environment === "production") rejectUnresolvedKeyVaultReferences(env);
   const configuredPath = optional(env, "DB_PATH");
   // The authority path is defined once, in the machine-readable deployment
   // contract, and shared with the runtime storage gate.
@@ -252,15 +266,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const marqueeClientSecret = optional(env, "MARQUEE_CLIENT_SECRET");
   if (environment === "production" && marqueeClientSecret) {
     throw new Error(
-      "MARQUEE_CLIENT_SECRET is not permitted in production; Marquee uses the managed identity selected by MARQUEE_CLIENT_ID"
+      "MARQUEE_CLIENT_SECRET is not permitted in production; Marquee uses the system-assigned managed identity"
+    );
+  }
+  if (marqueeClientSecret && (!marqueeTenantId || !marqueeClientId)) {
+    throw new Error(
+      "MARQUEE_TENANT_ID and MARQUEE_CLIENT_ID are required with MARQUEE_CLIENT_SECRET"
     );
   }
   if (
     environment === "production" &&
-    (!marqueeBaseUrl || !marqueeScope || !marqueeTenantId || !marqueeClientId)
+    (!marqueeBaseUrl || !marqueeScope)
   ) {
     throw new Error(
-      "MARQUEE_BASE_URL, MARQUEE_SCOPE, MARQUEE_TENANT_ID, and MARQUEE_CLIENT_ID are required"
+      "MARQUEE_BASE_URL and MARQUEE_SCOPE are required"
     );
   }
 

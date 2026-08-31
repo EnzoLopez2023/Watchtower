@@ -42,6 +42,9 @@ Hearth service or database.
   gap reports at 200.
 - Network Observer pushes are capped at 5,000 probes.
 - Unified log pushes are capped at 500 lines and 2,000 characters per message.
+- Network Observer obtains UniFi device identity from the service-authenticated
+  `GET /api/network-observer/discovery/unifi` route. It must not call the
+  interactive `/api/unifi` route without a user identity.
 - Large latest snapshots use gzip JSON BLOBs. Readers detect gzip magic bytes
   and retain plaintext JSON compatibility for older rows.
 - `received_at` is assigned by Watchtower and controls freshness, retention,

@@ -141,12 +141,15 @@ POST /api/unifi/ingest
 POST /api/unifi/logs/ingest
 POST /api/protect/ingest
 POST /api/network-observer/ingest
+GET  /api/network-observer/discovery/unifi
 POST /api/synology/ingest
 POST /api/agent-logs/ingest
 ```
 
 These endpoints use their agent-specific constant-time token contract rather
-than browser Entra roles. See [`AGENTS.md`](AGENTS.md).
+than browser Entra roles. The Network Observer discovery response is a bounded,
+identity-only view of UniFi devices and never exposes the interactive UniFi
+payload. See [`AGENTS.md`](AGENTS.md).
 
 ## Mobile
 

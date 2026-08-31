@@ -121,8 +121,6 @@ test("production config resolves its DB path to the contract authority", () => {
     AZURE_AD_AUDIENCE: "api://watchtower",
     ADMIN_OID: "d6c36f6e-054c-45b8-9468-16c208628814",
     MARQUEE_BASE_URL: "https://marquee.example",
-    MARQUEE_TENANT_ID: "52188f12-db6b-46c6-88ff-08c802f0ed3b",
-    MARQUEE_CLIENT_ID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     MARQUEE_SCOPE: "api://marquee/.default"
   });
   assert.equal(config.database.path, DEPLOYMENT_CONTRACT.persistentStorage.databasePath);

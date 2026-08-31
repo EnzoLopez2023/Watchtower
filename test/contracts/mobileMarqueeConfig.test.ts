@@ -10,8 +10,6 @@ const PRODUCTION: NodeJS.ProcessEnv = {
   AZURE_AD_AUDIENCE: "api://watchtower",
   ADMIN_OID: "d6c36f6e-054c-45b8-9468-16c208628814",
   MARQUEE_BASE_URL: "https://marquee.example",
-  MARQUEE_TENANT_ID: "52188f12-db6b-46c6-88ff-08c802f0ed3b",
-  MARQUEE_CLIENT_ID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
   MARQUEE_SCOPE: "api://marquee/.default"
 };
 
@@ -54,6 +52,19 @@ test("a non-HTTP scheme is rejected in every environment", () => {
   assert.throws(
     () => loadConfig({ ...DEVELOPMENT, MARQUEE_BASE_URL: "file:///etc/passwd" }),
     /MARQUEE_BASE_URL must use HTTP or HTTPS/
+  );
+});
+
+test("production rejects unresolved Key Vault references before they become credentials", () => {
+  assert.throws(
+    () =>
+      loadConfig(
+        production({
+          UNIFI_INGEST_TOKEN:
+            "@Microsoft.KeyVault(SecretUri=https://kv.example/secrets/UNIFI-INGEST-TOKEN/)"
+        })
+      ),
+    /Unresolved Azure Key Vault references: UNIFI_INGEST_TOKEN/
   );
 });
 
@@ -138,17 +149,17 @@ function credentialOf(client: unknown): unknown {
 }
 
 test("production resolves Marquee through managed identity, not a service principal", async () => {
-  const { ClientSecretCredential, DefaultAzureCredential } = await import("@azure/identity");
+  const { ClientSecretCredential, ManagedIdentityCredential } = await import("@azure/identity");
   const { createMediaHealthClient } = await import("../../server/clients/marqueeMediaHealth.js");
 
   const config = loadConfig(production());
   assert.equal(config.marquee.clientSecret, undefined);
-  assert.equal(config.marquee.clientId, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+  assert.equal(config.marquee.clientId, undefined);
 
   const credential = credentialOf(createMediaHealthClient(config.marquee));
   assert.ok(
-    credential instanceof DefaultAzureCredential,
-    "production must acquire its Marquee token from the workload identity"
+    credential instanceof ManagedIdentityCredential,
+    "production must acquire its Marquee token from the system-assigned workload identity"
   );
   assert.ok(!(credential instanceof ClientSecretCredential));
 });
@@ -167,6 +178,19 @@ test("development may still use a confidential client against a test tenant", as
   });
   const credential = credentialOf(createMediaHealthClient(config.marquee));
   assert.ok(credential instanceof ClientSecretCredential);
+});
+
+test("a local confidential client must include its tenant and client id", () => {
+  assert.throws(
+    () =>
+      loadConfig({
+        ...DEVELOPMENT,
+        MARQUEE_BASE_URL: "http://127.0.0.1:4310",
+        MARQUEE_SCOPE: "api://marquee/.default",
+        MARQUEE_CLIENT_SECRET: "s3cret"
+      }),
+    /MARQUEE_TENANT_ID and MARQUEE_CLIENT_ID are required/
+  );
 });
 
 test("an incompletely configured Marquee never falls back to an unauthenticated call", async () => {
