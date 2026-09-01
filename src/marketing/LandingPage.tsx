@@ -34,6 +34,7 @@ import { withAlpha } from '../theme/contrast';
 import { iosGlass } from '../theme/ios';
 import Embers from '../components/Embers';
 import { ErrorState } from '../components/StateBlocks';
+import WatchtowerBrand from '../components/WatchtowerBrand';
 import {
   GlanceMock,
   NetworkMock,
@@ -125,32 +126,18 @@ function Reveal({
 
 // ── Small building blocks ───────────────────────────────────────────────────
 
-function Logo({ color }: { color: string }) {
+function Logo() {
   return (
-    <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
-      <Box
-        aria-hidden
-        sx={{
-          width: 0,
-          height: 0,
-          borderLeft: '8px solid transparent',
-          borderRight: '8px solid transparent',
-          borderBottom: `14px solid ${color}`,
-        }}
-      />
-      <Typography
-        component="span"
-        sx={{
-          fontFamily: 'var(--hearth-heading)',
-          fontWeight: 800,
-          fontSize: '1.05rem',
-          letterSpacing: '-0.01em',
-          color: 'inherit',
-        }}
-      >
-        Watchtower
-      </Typography>
-    </Box>
+    <WatchtowerBrand
+      iconSize={26}
+      textSx={{
+        fontFamily: 'var(--hearth-heading)',
+        fontWeight: 800,
+        fontSize: '1.05rem',
+        letterSpacing: '-0.01em',
+        color: 'inherit',
+      }}
+    />
   );
 }
 
@@ -252,7 +239,7 @@ interface Ctx {
   busy: boolean;
 }
 
-function TopNav({ t, isDark, accent, onSignIn, busy }: Ctx) {
+function TopNav({ t, isDark, onSignIn, busy }: Ctx) {
   return (
     <Box
       component="header"
@@ -280,7 +267,7 @@ function TopNav({ t, isDark, accent, onSignIn, busy }: Ctx) {
           color: t.ink,
         }}
       >
-        <Logo color={accent} />
+        <Logo />
         <Button
           onClick={onSignIn}
           disabled={busy}
@@ -673,7 +660,7 @@ function CtaBand({ t, isDark, accent, onSignIn, busy }: Ctx) {
   );
 }
 
-function Footer({ t, accent }: Ctx) {
+function Footer({ t }: Ctx) {
   return (
     <Box component="footer" sx={{ borderTop: `1px solid ${t.line}` }}>
       <Box
@@ -691,7 +678,7 @@ function Footer({ t, accent }: Ctx) {
         }}
       >
         <Box sx={{ color: t.inkSoft }}>
-          <Logo color={accent} />
+          <Logo />
         </Box>
         <Typography sx={{ fontSize: '0.8rem' }}>
           Infrastructure operations · role-gated · read-only by default
