@@ -263,6 +263,61 @@ test("alert engine: the network observer needs three identical samples to confir
   }
 });
 
+test("alert engine: a Sonarr-only agents flap needs three samples in each direction", async () => {
+  const harness = createEngine("alert-agents-sonarr");
+  try {
+    const agents = (severity: "ok" | "warn", generation: number): Subsystem =>
+      tile({
+        key: "agents",
+        label: "On-site Agents",
+        severity,
+        headline: severity === "warn" ? "1 silent" : "7 reporting",
+        detail: severity === "warn" ? "Sonarr not reporting" : "All agents reporting",
+        escalation: severity === "warn" ? 1 : 0,
+        notificationPolicy: {
+          kind: "consecutive-samples",
+          sampleKey: String(generation),
+          generationKey: JSON.stringify({ agents: generation }),
+          signature: severity === "warn" ? "Sonarr" : "all-reporting",
+          failureSamples: severity === "warn" ? 3 : 1,
+          recoverySamples: 3
+        }
+      });
+
+    harness.setStatus(payload([agents("ok", 0)]));
+    await harness.engine.run();
+
+    harness.setStatus(payload([agents("warn", 1)]));
+    await harness.engine.run();
+    harness.setStatus(payload([agents("ok", 2)]));
+    await harness.engine.run();
+    assert.equal(harness.sent.length, 0, "a one-sample flap must stay silent");
+    assert.equal(await harness.repository.getCandidate("agents"), undefined);
+
+    for (const generation of [3, 4, 5]) {
+      harness.setStatus(payload([agents("warn", generation)]));
+      await harness.engine.run();
+    }
+    assert.equal(harness.sent.length, 1, "three Sonarr failures confirm the warning");
+    assert.match(harness.sent[0]?.body ?? "", /Sonarr not reporting/);
+
+    harness.setStatus(payload([agents("ok", 6)]));
+    await harness.engine.run();
+    harness.setStatus(payload([agents("warn", 7)]));
+    await harness.engine.run();
+    assert.equal(harness.sent.length, 1, "an unstable recovery must not rearm the warning");
+
+    for (const generation of [8, 9, 10]) {
+      harness.setStatus(payload([agents("ok", generation)]));
+      await harness.engine.run();
+    }
+    assert.equal(harness.sent.length, 2, "three healthy samples confirm recovery");
+    assert.match(harness.sent[1]?.title ?? "", /On-site Agents recovered/);
+  } finally {
+    harness.close();
+  }
+});
+
 test("alert engine: a repeated sample generation does not advance the confirmation count", async () => {
   const harness = createEngine("alert-observer-repeat");
   try {
