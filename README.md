@@ -33,6 +33,7 @@ npm test
 npm run build
 npm run audit:deps
 npm run check:no-postgres
+npm run check:icons
 ```
 
 Database import and recovery are explicit operator commands:

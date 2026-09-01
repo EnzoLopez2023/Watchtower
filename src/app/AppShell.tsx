@@ -50,6 +50,7 @@ import {
 import { withAlpha } from '../theme/contrast';
 import { DegradedBanner, ErrorState, LoadingState } from '../components/StateBlocks';
 import ReadOnlyNotice from '../components/ReadOnlyNotice';
+import WatchtowerBrand from '../components/WatchtowerBrand';
 import { identityLabel } from '../services/identity';
 import {
   GROUP_LABELS,
@@ -282,19 +283,19 @@ export default function AppShell() {
     >
       <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1 }}>
         <Box sx={{ minWidth: 0 }}>
-          <Typography
-            component="p"
-            sx={{
+          <WatchtowerBrand
+            iconSize={30}
+            textSx={{
               fontSize: '0.6rem',
               letterSpacing: '0.22em',
               textTransform: 'uppercase',
               color: t.rust,
               fontWeight: 800,
             }}
-          >
-            Watchtower
+          />
+          <Typography sx={{ mt: 0.35, fontSize: '0.7rem', color: t.muted }}>
+            Infrastructure operations
           </Typography>
-          <Typography sx={{ fontSize: '0.7rem', color: t.muted }}>Infrastructure operations</Typography>
         </Box>
         <ModeToggle />
       </Box>

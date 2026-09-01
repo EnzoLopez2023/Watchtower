@@ -21,7 +21,9 @@
     "reconcile": "tsx scripts/reconcile.ts",
     "recovery": "tsx scripts/recovery.ts",
     "audit:deps": "npm audit --omit=dev",
-    "check:no-postgres": "node scripts/check-no-postgres.mjs"
+    "check:no-postgres": "node scripts/check-no-postgres.mjs",
+    "icons:generate": "node scripts/generate-icons.mjs",
+    "check:icons": "node scripts/generate-icons.mjs --check"
   },
   "dependencies": {
     "@azure/arm-appservice": "^19.0.0",
