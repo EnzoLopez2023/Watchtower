@@ -136,6 +136,7 @@ const RANK: Readonly<Record<Severity, number>> = { ok: 0, stale: 1, warn: 2, cri
 
 export const NETWORK_OBSERVER_ALERT_DEFAULT_SAMPLES = 3;
 const NETWORK_OBSERVER_ALERT_MAX_SAMPLES = 10;
+const AGENT_ALERT_CONFIRMATION_SAMPLES = 3;
 
 const worst = (...severities: readonly Severity[]): Severity =>
   severities.reduce<Severity>((a, b) => (RANK[b] > RANK[a] ? b : a), "ok");
@@ -809,7 +810,9 @@ function agentAgo(now: number, ms: number | null): string | null {
  *
  * Sonarr is not an owned collector any more: its liveness comes from the Marquee
  * media-health contract, and an unreachable contract is reported as unknown
- * rather than assumed healthy.
+ * rather than assumed healthy. A Sonarr-only failure is confirmation-gated because
+ * Marquee cold starts can briefly publish it as absent; owned-agent failures remain
+ * immediate, and recoveries must remain stable before they are announced.
  */
 async function agentsStatus(
   repository: InfraStatusRepository,
@@ -858,6 +861,7 @@ async function agentsStatus(
 
   const silentLabels = [...staleOnes.map((check) => check.label)];
   if (sonarrSilent) silentLabels.push(sonarrPolicy.label);
+  const sonarrOnlySilent = sonarrSilent && staleOnes.length === 0;
 
   const agents: AgentUnit[] = checks.map((check) => ({
     id: check.label,
@@ -897,7 +901,15 @@ async function agentsStatus(
     lastContactAt: oldestContactAt,
     oldestContactAt,
     agents,
-    escalation: silentCount
+    escalation: silentCount,
+    notificationPolicy: {
+      kind: "consecutive-samples",
+      sampleKey: String(now),
+      generationKey: JSON.stringify({ agents: now }),
+      signature: silentLabels.length ? silentLabels.join("|") : "all-reporting",
+      failureSamples: sonarrOnlySilent ? AGENT_ALERT_CONFIRMATION_SAMPLES : 1,
+      recoverySamples: AGENT_ALERT_CONFIRMATION_SAMPLES
+    }
   };
 }
 

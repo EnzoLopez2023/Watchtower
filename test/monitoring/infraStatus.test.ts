@@ -55,10 +55,71 @@ test("infra status: no data reports stale rather than healthy", async () => {
     assert.equal(subsystem(status.subsystems, "cameras").severity, "ok");
     // The shutdown watchdog is the one agent whose silence is critical, so an
     // empty database is loud rather than quietly "all systems OK".
-    assert.equal(subsystem(status.subsystems, "agents").severity, "critical");
+    const agents = subsystem(status.subsystems, "agents");
+    assert.equal(agents.severity, "critical");
+    assert.equal(agents.notificationPolicy?.failureSamples, 1);
     assert.equal(status.overall.severity, "critical");
     assert.ok(status.overall.issueCount >= 1);
     assert.match(status.overall.summary, /On-site Agents/);
+  } finally {
+    context.close();
+  }
+});
+
+test("infra status: a Sonarr-only agent failure requires stable samples", async () => {
+  const context = harness("infra-sonarr-confirmation");
+  try {
+    writeUnifiLatest(context.database, NOW - 5_000, {
+      wan: { status: "up", _health: { www: { status: "ok" } } },
+      devices: []
+    });
+    context.database
+      .prepare("INSERT INTO protect_latest (id, received_at, payload) VALUES (1, ?, ?)")
+      .run(NOW - 5_000, packJson({ cameras: [] }));
+    context.database
+      .prepare(
+        `INSERT INTO ups_readings (received_at, ups_id, ups_label, ups_status, raw)
+         VALUES (?, 'tower', 'Tower', 'OL', '{}')`
+      )
+      .run(NOW - 5_000);
+    context.database
+      .prepare(
+        `INSERT INTO agent_logs (agent, ts, level, message, received_at)
+         VALUES ('shutdown', ?, 'info', 'heartbeat', ?)`
+      )
+      .run(NOW - 5_000, NOW - 5_000);
+    context.database
+      .prepare(
+        `INSERT INTO synology_latest (nas_id, label, host, payload, received_at)
+         VALUES ('nas', 'NAS', NULL, ?, ?)`
+      )
+      .run(packJson({ disks: [], volumes: [] }), NOW - 5_000);
+
+    const status = await context.build(
+      NOW,
+      stubMediaHealth({
+        schema: "marquee.media-health.v1",
+        generatedAt: "2026-08-28T12:00:00.000Z",
+        overall: "degraded",
+        build: { app: "marquee" },
+        sqlite: { ready: true, schemaVersion: 4 },
+        providers: {
+          plex: { configured: true, lastSuccessAt: null, lastFailureAt: null, latencyMs: 12 },
+          tautulli: { configured: true, lastSuccessAt: null, lastFailureAt: null, latencyMs: 9 }
+        },
+        sonarr: { present: false },
+        duplicates: {}
+      })
+    );
+    const agents = subsystem(status.subsystems, "agents");
+
+    assert.equal(agents.severity, "warn");
+    assert.equal(agents.headline, "1 silent");
+    assert.equal(agents.detail, "Sonarr not reporting");
+    assert.equal(agents.notificationPolicy?.signature, "Sonarr");
+    assert.equal(agents.notificationPolicy?.failureSamples, 3);
+    assert.equal(agents.notificationPolicy?.recoverySamples, 3);
+    assert.equal(agents.notificationPolicy?.generationKey, JSON.stringify({ agents: NOW }));
   } finally {
     context.close();
   }

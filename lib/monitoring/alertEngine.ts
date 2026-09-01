@@ -10,6 +10,7 @@ import type { DeliveryOutcome, DeliveryPlan, PushNotification } from "./pushDeli
 import { asText } from "./values.js";
 
 const RANK: Readonly<Record<string, number>> = { ok: 0, stale: 1, warn: 2, critical: 3 };
+const AGENTS_SUBSYSTEM = "agents";
 const NETWORK_OBSERVER_SUBSYSTEM = "network-observer";
 const SAMPLE_POLICY_KIND = "consecutive-samples";
 const SAMPLE_DEDUPE_PREFIX = "sample-confirmation:";
@@ -136,7 +137,9 @@ function confirmationSamples(value: number | undefined): number {
 
 function notificationPolicyOf(subsystem: Subsystem): SamplePolicy | null {
   const policy =
-    subsystem.key === NETWORK_OBSERVER_SUBSYSTEM ? subsystem.notificationPolicy : undefined;
+    subsystem.key === NETWORK_OBSERVER_SUBSYSTEM || subsystem.key === AGENTS_SUBSYSTEM
+      ? subsystem.notificationPolicy
+      : undefined;
   if (policy?.kind !== SAMPLE_POLICY_KIND) return null;
   const sampleKey = asText(policy.sampleKey);
   const signature = asText(policy.signature);
