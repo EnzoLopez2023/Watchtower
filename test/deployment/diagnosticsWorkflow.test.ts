@@ -313,6 +313,8 @@ test("recovery freshness and the custom-container invariant remain real checks",
   assert.match(recovery, /\.recovery\.uploadConfigured/);
   assert.match(recovery, /\.recovery\.restoreVerificationEnabled/);
   assert.match(recovery, /\.offhostBackup\.lastOutcome\.status == "success"/);
+  assert.match(recovery, /stale_threshold=26/);
+  assert.match(recovery, /configuredThresholdMatches/);
   assert.match(recovery, /staleThresholdHours \* 3600000/);
   assert.doesNotMatch(recovery, /az storage|blob\.core\.windows\.net/);
 
@@ -321,6 +323,10 @@ test("recovery freshness and the custom-container invariant remain real checks",
   assert.match(configuration, /customContainerConfigured:/);
   assert.match(configuration, /startswith\("DOCKER\|"\)/);
   assert.match(configuration, /appSettingMismatches:/);
+  assert.match(
+    configuration,
+    /\{ name: "OFFHOST_BACKUP_STALE_HOURS", expected: "26" \}/
+  );
   assert.match(configuration, /map\(select\(\$actual\[\.name\] != \.expected\) \| \.name\)/);
   assert.match(configuration, /\(\.appSettingMismatches \| length\) == 0/);
   assert.match(configuration, /\.siteInvariants\.customContainerConfigured == true/);
@@ -509,6 +515,37 @@ test("migration and readiness prechecks reject incomplete or contradictory autho
   assert.equal(validReadiness.status, 0, validReadiness.stderr);
   assert.equal(validReadiness.reportExists, true);
 
+  const stoppedWorkers = runPrecheck({
+    checkId: "readiness-precondition-precheck",
+    response: {
+      ok: true,
+      lifecycle: "ready",
+      authority: {
+        engine: "sqlite",
+        path: "/home/data/watchtower.db",
+        journalMode: "delete",
+        schemaVersion: 2,
+        migrationCount: 2,
+        migrationIdentityDigest: migrationDigest,
+        ownedTableCount: 54,
+        requiredOwnedTableCount: 54,
+        ownedSchemaDigest: schemaDigest,
+        expectedOwnedSchemaDigest: schemaDigest
+      },
+      workers: {
+        "instance-lease": { state: "stopped" },
+        "monitoring-archive": { state: "stopped" },
+        "offhost-recovery": { state: "stopped" },
+        "outage-postmortems": { state: "stopped" },
+        "unifi-logs-backfill": { state: "stopped" }
+      }
+    },
+    report: "evidence/readiness-precheck.json",
+    raw: "evidence/readiness-precheck.raw"
+  });
+  assert.notEqual(stoppedWorkers.status, 0, stoppedWorkers.stderr);
+  assert.equal(stoppedWorkers.reportExists, true);
+
   const contradictoryReadiness = runPrecheck({
     checkId: "readiness-precondition-precheck",
     response: {
@@ -541,12 +578,13 @@ test("migration and readiness prechecks reject incomplete or contradictory autho
   assert.equal(contradictoryReadiness.reportExists, false);
 });
 
-function runRecoveryPrecheck(response: unknown): {
+function runRecoveryPrecheck(response: unknown, staleThreshold = "26"): {
   readonly status: number | null;
   readonly reportExists: boolean;
   readonly rawExists: boolean;
   readonly report?: {
     readonly offhostBackup: {
+      readonly configuredThresholdMatches: boolean;
       readonly lastOutcome: { readonly fresh: boolean } | null;
     };
   };
@@ -584,7 +622,7 @@ esac
           FAKE_DIGEST: digest,
           FAKE_RESPONSE: JSON.stringify(response),
           FAKE_SETTINGS: JSON.stringify([
-            { name: "OFFHOST_BACKUP_STALE_HOURS", value: "26" }
+            { name: "OFFHOST_BACKUP_STALE_HOURS", value: staleThreshold }
           ]),
           GITHUB_RUN_ATTEMPT: "1",
           GITHUB_RUN_ID: "1",
@@ -610,6 +648,7 @@ esac
         ? {
             report: JSON.parse(readFileSync(reportPath, "utf8")) as {
               readonly offhostBackup: {
+                readonly configuredThresholdMatches: boolean;
                 readonly lastOutcome: { readonly fresh: boolean } | null;
               };
             }
@@ -652,6 +691,28 @@ test("recovery precheck trusts only a fresh successful in-app verify-and-restore
   });
   assert.notEqual(stale.status, 0, stale.stderr);
   assert.equal(stale.report?.offhostBackup.lastOutcome?.fresh, false);
+
+  const weakenedThreshold = runRecoveryPrecheck(
+    {
+      recovery: {
+        enabled: true,
+        uploadConfigured: true,
+        restoreVerificationEnabled: true,
+        lastOutcome: {
+          status: "success",
+          at: Date.now() - 365 * 24 * 60 * 60 * 1000,
+          durationMs: 12_345
+        }
+      }
+    },
+    "999999"
+  );
+  assert.notEqual(weakenedThreshold.status, 0, weakenedThreshold.stderr);
+  assert.equal(
+    weakenedThreshold.report?.offhostBackup.configuredThresholdMatches,
+    false
+  );
+  assert.equal(weakenedThreshold.report?.offhostBackup.lastOutcome?.fresh, false);
 
   const missingOutcome = runRecoveryPrecheck({ ok: true });
   assert.notEqual(missingOutcome.status, 0, missingOutcome.stderr);
@@ -740,6 +801,7 @@ test("protected configuration compares values in memory but reports names only",
     { name: "BUILD_SHA", value: "a".repeat(40) },
     { name: "DB_PATH", value: "/home/data/watchtower.db" },
     { name: "NODE_ENV", value: "production" },
+    { name: "OFFHOST_BACKUP_STALE_HOURS", value: "26" },
     { name: "PORT", value: "3000" },
     { name: "SQLITE_JOURNAL_MODE", value: "DELETE" },
     { name: "WEBSITES_ENABLE_APP_SERVICE_STORAGE", value: "true" }

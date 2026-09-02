@@ -36,6 +36,7 @@ test("/api/live is process-only and /api/ready performs the bounded DB check", a
   await withTestDatabase(async (database, directory) => {
     let authCalls = 0;
     let readinessCalls = 0;
+    let workerState = "healthy";
     const readiness = new SqliteReadinessRepository(database, []);
     const app = createApp({
       config: loadConfig({ NODE_ENV: "test", DB_PATH: `${directory}/watchtower.db` }),
@@ -49,7 +50,7 @@ test("/api/live is process-only and /api/ready performs the bounded DB check", a
             return readiness.check();
           }
         },
-        workers: { status: () => ({ alertEngine: { state: "healthy", updatedAt: Date.now() } }) },
+        workers: { status: () => ({ alertEngine: { state: workerState, updatedAt: Date.now() } }) },
         recovery: {
           status: () => ({
             enabled: true,
@@ -119,7 +120,12 @@ test("/api/live is process-only and /api/ready performs the bounded DB check", a
           durationMs: 12_345
         }
       });
-      assert.equal(readinessCalls, 1);
+      workerState = "stopped";
+      const stoppedWorker = await fetch(new URL("/api/ready", baseUrl));
+      assert.equal(stoppedWorker.status, 503);
+      assert.equal((await stoppedWorker.json() as { ok: boolean }).ok, false);
+
+      assert.equal(readinessCalls, 2);
       assert.equal(authCalls, 0);
     });
   });

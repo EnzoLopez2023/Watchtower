@@ -119,7 +119,7 @@ export function createPublicCoreRouter(dependencies: CoreRouteDependencies): Rou
       const lifecycle = dependencies.lifecycle();
       const workers = dependencies.workers.status();
       const workersReady = Object.values(workers).every(({ state }) =>
-        ["healthy", "degraded", "stopped"].includes(state)
+        ["healthy", "degraded"].includes(state)
       );
       const ok = database.ok && lifecycle.state === "ready" && workersReady;
       response.status(ok ? 200 : 503).json({

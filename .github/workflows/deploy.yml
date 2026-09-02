@@ -558,12 +558,22 @@ jobs:
               az webapp config appsettings list \
                 --resource-group "$RG" --name "$WEBAPP" --output json
             )"
-            stale_threshold="$(
-              jq -er '
-                (map({(.name): .value}) | add).OFFHOST_BACKUP_STALE_HOURS // "26" |
-                select(test("^[1-9][0-9]*$"))
-              ' <<<"$settings"
+            jq -e '
+              type == "array" and
+              all(.[];
+                type == "object" and
+                ((.name | type) == "string") and
+                ((.value | type) == "string"))
+            ' <<<"$settings" > /dev/null
+            configured_stale_threshold="$(
+              jq -r '(map({(.name): .value}) | add).OFFHOST_BACKUP_STALE_HOURS // ""' \
+                <<<"$settings"
             )"
+            stale_threshold=26
+            threshold_matches=false
+            if [[ "$configured_stale_threshold" == "$stale_threshold" ]]; then
+              threshold_matches=true
+            fi
             curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
               -H 'Cache-Control: no-cache' \
               "$PRODUCTION_URL$READY_PATH?recovery-precheck=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
@@ -591,6 +601,7 @@ jobs:
               --arg expectedDigest "$PREVIOUS_IMAGE_DIGEST" \
               --arg registryDigest "$registry_digest" \
               --argjson staleThresholdHours "$stale_threshold" \
+              --argjson thresholdMatches "$threshold_matches" \
               --argjson nowMs "$(date +%s000)" \
               '{
                 rollback: {
@@ -603,6 +614,7 @@ jobs:
                   enabled: .recovery.enabled,
                   uploadConfigured: .recovery.uploadConfigured,
                   restoreVerificationEnabled: .recovery.restoreVerificationEnabled,
+                  configuredThresholdMatches: $thresholdMatches,
                   staleThresholdHours: $staleThresholdHours,
                   lastOutcome: (
                     if .recovery.lastOutcome == null then null
@@ -625,6 +637,7 @@ jobs:
               .offhostBackup.enabled == true and
               .offhostBackup.uploadConfigured == true and
               .offhostBackup.restoreVerificationEnabled == true and
+              .offhostBackup.configuredThresholdMatches == true and
               .offhostBackup.lastOutcome.status == "success" and
               .offhostBackup.lastOutcome.fresh == true
             ' evidence/recovery-precheck.json > /dev/null
@@ -697,7 +710,7 @@ jobs:
               .ok == true and
               .lifecycle == "ready" and
               ([.workers[].state] |
-                all(. == "healthy" or . == "degraded" or . == "stopped"))
+                all(. == "healthy" or . == "degraded"))
             ' evidence/readiness-precheck.json > /dev/null
 
       - name: Diagnostic — monitoring resources
@@ -825,6 +838,7 @@ jobs:
                   { name: "BACKUP_ROOT", expected: "/home/data/backups/watchtower" },
                   { name: "DB_PATH", expected: "/home/data/watchtower.db" },
                   { name: "NODE_ENV", expected: "production" },
+                  { name: "OFFHOST_BACKUP_STALE_HOURS", expected: "26" },
                   { name: "PORT", expected: "3000" },
                   { name: "SQLITE_JOURNAL_MODE", expected: "DELETE" },
                   { name: "WEBSITES_ENABLE_APP_SERVICE_STORAGE", expected: "true" }
@@ -864,6 +878,7 @@ jobs:
                 "BUILD_SHA",
                 "DB_PATH",
                 "NODE_ENV",
+                "OFFHOST_BACKUP_STALE_HOURS",
                 "PORT",
                 "SQLITE_JOURNAL_MODE",
                 "WEBSITES_ENABLE_APP_SERVICE_STORAGE"
