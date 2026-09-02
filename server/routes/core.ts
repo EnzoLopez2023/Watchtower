@@ -33,12 +33,28 @@ export interface WorkerReadiness {
   status(): Readonly<Record<string, { readonly state: string; readonly updatedAt: number }>>;
 }
 
+export interface RecoveryDiagnosticStatus {
+  readonly enabled: boolean;
+  readonly uploadConfigured: boolean;
+  readonly restoreVerificationEnabled: boolean;
+  readonly lastOutcome: {
+    readonly status: "success" | "failed" | "skipped";
+    readonly at: number;
+    readonly durationMs: number | null;
+  } | null;
+}
+
+export interface RecoveryDiagnostics {
+  status(): RecoveryDiagnosticStatus;
+}
+
 export interface CoreRouteDependencies {
   readonly startedAt: number;
   readonly databasePath: string;
   readonly lifecycle: () => LifecycleState;
   readonly readiness: ReadinessRepository;
   readonly workers: WorkerReadiness;
+  readonly recovery?: RecoveryDiagnostics;
   readonly identities: IdentityRepository;
   readonly audit: AuditRepository;
   readonly settings: SettingsRepository;
@@ -114,13 +130,16 @@ export function createPublicCoreRouter(dependencies: CoreRouteDependencies): Rou
           path: dependencies.databasePath,
           journalMode: database.journalMode,
           schemaVersion: database.schemaVersion,
+          migrationCount: database.migrationCount,
+          migrationIdentityDigest: database.migrationIdentityDigest,
           ownedTableCount: database.ownedTableCount,
           requiredOwnedTableCount: database.requiredOwnedTableCount,
           ownedSchemaDigest: database.ownedSchemaDigest,
           expectedOwnedSchemaDigest: database.expectedOwnedSchemaDigest
         },
         lifecycle: lifecycle.state,
-        workers
+        workers,
+        ...(dependencies.recovery ? { recovery: dependencies.recovery.status() } : {})
       });
     } catch {
       response.status(503).json({

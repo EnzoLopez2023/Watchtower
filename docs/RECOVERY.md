@@ -5,9 +5,12 @@ the Watchtower SQLite authority.
 
 No recovery operation runs during startup or on a request path. There is no
 integrity scan, repair or unbounded migration behind `/api/live`, `/api/ready` or
-any route. The commands below are operator-invoked. An optional scheduled worker
-may invoke the same verified primitives only after its startup delay and only
-when `OFFHOST_BACKUP_ENABLED=true`.
+any route. `/api/ready` only reports secret-safe configuration booleans and the
+status/timestamp of the scheduled worker's last completed pass, so deployment
+diagnostics can evaluate freshness without reaching private Blob storage. The
+commands below are operator-invoked. An optional scheduled worker may invoke the
+same verified primitives only after its startup delay and only when
+`OFFHOST_BACKUP_ENABLED=true`.
 
 ## Contract
 

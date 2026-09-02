@@ -44,6 +44,30 @@ function checksum(sql: string): string {
   return createHash("sha256").update(sql).digest("hex");
 }
 
+export function migrationIdentities(
+  migrations: readonly Migration[] = CORE_MIGRATIONS
+): readonly AppliedMigration[] {
+  return [...migrations]
+    .sort((a, b) => a.version - b.version)
+    .map((migration) => ({
+      version: migration.version,
+      name: migration.name,
+      checksum: checksum(migration.sql)
+    }));
+}
+
+export function migrationIdentityDigest(
+  identities: readonly AppliedMigration[]
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify(identities.map(({ version, name, checksum: identity }) => ({
+      version,
+      name,
+      checksum: identity
+    }))))
+    .digest("hex");
+}
+
 function toNumber(value: bigint | number): number {
   return typeof value === "bigint" ? Number(value) : value;
 }

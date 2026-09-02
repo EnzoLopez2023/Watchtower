@@ -17,12 +17,16 @@
  * in this worktree fails closed rather than being written to.
  */
 
-import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import type { Database as SqliteDatabase } from "better-sqlite3";
 import { ImportError } from "./errors.js";
 import { quoteIdentifier, tableExists } from "./schema.js";
-import { assertMigrationsComplete, migrateDatabase, MigrationError } from "../migrate.js";
+import {
+  assertMigrationsComplete,
+  migrateDatabase,
+  migrationIdentities,
+  MigrationError
+} from "../migrate.js";
 import { CORE_MIGRATIONS } from "../migrations/core.js";
 
 export type AppLocalSchemaMode = "migrate" | "require";
@@ -47,17 +51,9 @@ export interface MigrationIdentity {
   readonly checksum: string;
 }
 
-function migrationChecksum(sql: string): string {
-  return createHash("sha256").update(sql).digest("hex");
-}
-
 /** The migration identities `migrateDatabase` records, from the app's own list. */
 export function coreMigrationIdentities(): MigrationIdentity[] {
-  return CORE_MIGRATIONS.map((migration) => ({
-    version: migration.version,
-    name: migration.name,
-    checksum: migrationChecksum(migration.sql)
-  })).sort((a, b) => a.version - b.version);
+  return [...migrationIdentities(CORE_MIGRATIONS)];
 }
 
 function columnNames(database: SqliteDatabase, table: string): string[] {

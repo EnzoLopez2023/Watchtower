@@ -82,6 +82,25 @@ const instanceOwner = (process.env.WEBSITE_INSTANCE_ID?.trim() || `${hostname()}
 // First in the array, so WorkerManager starts it before any domain worker and —
 // because stop() unwinds in reverse start order — releases it only after every
 // domain worker has stopped writing.
+const offhostRecovery = createOffhostRecoveryWorker({
+  enabled: config.offhostRecovery.enabled,
+  run: (signal) =>
+    runOffhostRecoveryPass(
+      {
+        config: config.offhostRecovery,
+        databasePath: config.database.path,
+        appVersion: BUILD_IDENTITY.version,
+        buildId: String(BUILD_IDENTITY.source.build),
+        sourceCommit: BUILD_IDENTITY.source.commit,
+        log: (message) => console.info(JSON.stringify({ event: "watchtower.recovery", message }))
+      },
+      signal
+    ),
+  intervalMs: config.offhostRecovery.intervalHours * 60 * 60 * 1000,
+  startDelayMs: config.offhostRecovery.startDelayMs,
+  retryDelayMs: config.offhostRecovery.retryDelayMs,
+  log: (message) => console.info(message)
+});
 const managedWorkers: ManagedWorker[] = [
   new InstanceLeaseWorker(
     new SqliteInstanceLeaseRepository(database),
@@ -105,25 +124,7 @@ const managedWorkers: ManagedWorker[] = [
   // Between the lease and the writers: it needs the lease held for its whole
   // pass, and reverse-order shutdown then stops it after the writers have gone
   // quiet but before the lease is released and the database is closed.
-  createOffhostRecoveryWorker({
-    enabled: config.offhostRecovery.enabled,
-    run: (signal) =>
-      runOffhostRecoveryPass(
-        {
-          config: config.offhostRecovery,
-          databasePath: config.database.path,
-          appVersion: BUILD_IDENTITY.version,
-          buildId: String(BUILD_IDENTITY.source.build),
-          sourceCommit: BUILD_IDENTITY.source.commit,
-          log: (message) => console.info(JSON.stringify({ event: "watchtower.recovery", message }))
-        },
-        signal
-      ),
-    intervalMs: config.offhostRecovery.intervalHours * 60 * 60 * 1000,
-    startDelayMs: config.offhostRecovery.startDelayMs,
-    retryDelayMs: config.offhostRecovery.retryDelayMs,
-    log: (message) => console.info(message)
-  }),
+  offhostRecovery,
   createMonitoringArchiveWorker({
     config: config.monitoringArchive,
     repository: container.repositories.archive
@@ -154,6 +155,23 @@ const app = createApp({
     lifecycle: () => lifecycle,
     readiness,
     workers,
+    recovery: {
+      status: () => {
+        const outcome = offhostRecovery.lastOutcome();
+        return {
+          enabled: config.offhostRecovery.enabled,
+          uploadConfigured: config.offhostRecovery.account !== undefined,
+          restoreVerificationEnabled: config.offhostRecovery.verifyRestore,
+          lastOutcome: outcome === null
+            ? null
+            : {
+                status: outcome.status,
+                at: outcome.at,
+                durationMs: outcome.status === "success" ? outcome.durationMs : null
+              }
+        };
+      }
+    },
     identities,
     audit,
     settings

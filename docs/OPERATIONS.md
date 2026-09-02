@@ -18,10 +18,12 @@
 `GET /api/live` is process-only. It must remain usable without opening or
 querying SQLite.
 
-`GET /api/ready` performs only a bounded `SELECT 1`, migration identity check,
-journal-mode check, lifecycle check, and worker-state snapshot. It returns 503
-while starting or draining and does not expose SQL, tokens, provider URLs, or
-secret values.
+`GET /api/ready` performs only a bounded `SELECT 1`, migration identity digest,
+journal-mode check, lifecycle check, and worker-state snapshot. It also exposes
+secret-safe booleans and the timestamp/status of the last scheduled off-host
+recovery pass; it never starts backup, upload, or restore work. It returns 503
+while starting or draining and does not expose SQL, tokens, provider URLs,
+storage names, recovery errors, or secret values.
 
 `GET /api/version` and `GET /version.json` return the same immutable Watchtower
 and source identities. Deployment must compare those values with the intended

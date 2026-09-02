@@ -99,7 +99,9 @@ jobs:
           npm ci --no-audit --no-fund
 
       - name: Diagnostic — production dependency audit
+        id: source_dependency_diagnostic
         timeout-minutes: 3
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: source-dependency-audit
@@ -114,7 +116,9 @@ jobs:
             npm audit --omit=dev --audit-level=high --json > evidence/npm-audit.json
 
       - name: Diagnostic — source dependency SBOM
+        id: source_sbom_diagnostic
         timeout-minutes: 3
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: source-sbom
@@ -271,6 +275,7 @@ jobs:
         id: image_sbom_diagnostic
         if: ${{ always() }}
         timeout-minutes: 1
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: image-sbom
@@ -301,6 +306,7 @@ jobs:
         id: image_scan_diagnostic
         if: ${{ always() }}
         timeout-minutes: 1
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: image-vulnerability-scan
@@ -321,6 +327,7 @@ jobs:
       - name: Diagnostic — sign and verify exact image
         id: signature_diagnostic
         timeout-minutes: 5
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: signature-verification
@@ -346,6 +353,7 @@ jobs:
       - name: Diagnostic — attest and verify provenance and SBOM
         id: provenance_diagnostic
         timeout-minutes: 8
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: provenance-attestation-verification
@@ -431,7 +439,9 @@ jobs:
             fi
 
       - name: Diagnostic — migration compatibility precheck
+        id: migration_diagnostic
         timeout-minutes: 2
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: migration-compatibility-precheck
@@ -444,11 +454,6 @@ jobs:
           timeout-ms: '60000'
           run: |
             set -euo pipefail
-            candidate_version="$(
-              node --import tsx --input-type=module --eval \
-                'import { CORE_MIGRATIONS } from "./lib/db/migrations/core.ts"; process.stdout.write(String(CORE_MIGRATIONS.at(-1)?.version ?? 0));'
-            )"
-            [[ "$candidate_version" =~ ^[0-9]+$ ]]
             current="$(
               curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
                 -H 'Cache-Control: no-cache' \
@@ -462,24 +467,76 @@ jobs:
               ((.authority.schemaVersion | type) == "number") and
               .authority.schemaVersion >= 0 and
               .authority.schemaVersion == (.authority.schemaVersion | floor) and
+              ((.authority.migrationCount | type) == "number") and
+              .authority.migrationCount >= 0 and
+              .authority.migrationCount == (.authority.migrationCount | floor) and
+              ((.authority.migrationIdentityDigest | type) == "string") and
+              (.authority.migrationIdentityDigest | test("^[0-9a-f]{64}$")) and
               ((.authority.ownedSchemaDigest | type) == "string") and
               (.authority.ownedSchemaDigest | test("^[0-9a-f]{64}$")) and
               ((.authority.expectedOwnedSchemaDigest | type) == "string") and
               (.authority.expectedOwnedSchemaDigest | test("^[0-9a-f]{64}$"))
             ' evidence/migration-compatibility.raw > /dev/null
-            jq -e --argjson candidate "$candidate_version" \
-              '{candidateMaxMigrationVersion: $candidate, currentRelease: .}' \
+            current_count="$(
+              jq -r '.authority.migrationCount' evidence/migration-compatibility.raw
+            )"
+            candidate="$(
+              node --import tsx --input-type=module --eval '
+                import {
+                  migrationIdentities,
+                  migrationIdentityDigest
+                } from "./lib/db/migrate.ts";
+                const appliedCount = Number(process.argv[1]);
+                const identities = migrationIdentities();
+                const prefixAvailable =
+                  Number.isSafeInteger(appliedCount) &&
+                  appliedCount >= 0 &&
+                  appliedCount <= identities.length;
+                process.stdout.write(JSON.stringify({
+                  maxMigrationVersion: identities.at(-1)?.version ?? 0,
+                  migrationCount: identities.length,
+                  fullIdentityDigest: migrationIdentityDigest(identities),
+                  appliedPrefixIdentityDigest: prefixAvailable
+                    ? migrationIdentityDigest(identities.slice(0, appliedCount))
+                    : null,
+                  prefixAvailable
+                }));
+              ' "$current_count"
+            )"
+            jq -e '
+              type == "object" and
+              ((.maxMigrationVersion | type) == "number") and
+              ((.migrationCount | type) == "number") and
+              ((.fullIdentityDigest | type) == "string") and
+              (.fullIdentityDigest | test("^[0-9a-f]{64}$")) and
+              ((.prefixAvailable | type) == "boolean") and
+              (
+                (.prefixAvailable == false and .appliedPrefixIdentityDigest == null) or
+                (
+                  .prefixAvailable == true and
+                  ((.appliedPrefixIdentityDigest | type) == "string") and
+                  (.appliedPrefixIdentityDigest | test("^[0-9a-f]{64}$"))
+                )
+              )
+            ' <<<"$candidate" > /dev/null
+            jq -e --argjson candidate "$candidate" \
+              '{candidate: $candidate, currentRelease: .}' \
               evidence/migration-compatibility.raw > evidence/migration-compatibility.json
             jq -e '
               .currentRelease.ok == true and
-              ((.currentRelease.authority.schemaVersion | type) == "number") and
-              .currentRelease.authority.schemaVersion <= .candidateMaxMigrationVersion and
+              .candidate.prefixAvailable == true and
+              .currentRelease.authority.schemaVersion <= .candidate.maxMigrationVersion and
+              .currentRelease.authority.migrationCount <= .candidate.migrationCount and
+              .currentRelease.authority.migrationIdentityDigest ==
+                .candidate.appliedPrefixIdentityDigest and
               .currentRelease.authority.ownedSchemaDigest ==
                 .currentRelease.authority.expectedOwnedSchemaDigest
             ' evidence/migration-compatibility.json > /dev/null
 
       - name: Diagnostic — backup and recovery precondition
-        timeout-minutes: 15
+        id: recovery_diagnostic
+        timeout-minutes: 2
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: recovery-precondition-precheck
@@ -487,8 +544,9 @@ jobs:
           phase: pre-activation
           report: evidence/recovery-precheck.json
           report-format: generic-json
+          evidence: evidence/recovery-precheck.raw
           records: ${{ env.DIAGNOSTIC_RECORDS }}
-          timeout-ms: '840000'
+          timeout-ms: '60000'
           run: |
             set -euo pipefail
             registry_digest="$(
@@ -500,293 +558,81 @@ jobs:
               az webapp config appsettings list \
                 --resource-group "$RG" --name "$WEBAPP" --output json
             )"
-            setting_values="$(jq -ce '(map({(.name): .value}) | add) // {}' <<<"$settings")"
-            backup_flag="$(jq -r '.OFFHOST_BACKUP_ENABLED // "false"' <<<"$setting_values")"
-            backup_account="$(jq -r '.OFFHOST_BACKUP_ACCOUNT // ""' <<<"$setting_values")"
-            backup_container="$(jq -r '.OFFHOST_BACKUP_CONTAINER // ""' <<<"$setting_values")"
-            backup_prefix="$(jq -r '.OFFHOST_BACKUP_PREFIX // ""' <<<"$setting_values")"
-            stale_threshold="$(jq -r '.OFFHOST_BACKUP_STALE_HOURS // "26"' <<<"$setting_values")"
-
-            rollback_resolvable=false
-            if [[ "$registry_digest" == "$PREVIOUS_IMAGE_DIGEST" ]]; then
-              rollback_resolvable=true
-            fi
-            backup_enabled=false
-            if [[ "$backup_flag" == "true" ]]; then backup_enabled=true; fi
-            account_configured=false
-            if [[ -n "$backup_account" ]]; then account_configured=true; fi
-            container_configured=false
-            if [[ -n "$backup_container" ]]; then container_configured=true; fi
-            threshold_valid=false
-            if [[ "$stale_threshold" =~ ^[1-9][0-9]*$ ]]; then threshold_valid=true; fi
-
-            if [[
-              "$backup_enabled" != "true" ||
-              "$account_configured" != "true" ||
-              "$container_configured" != "true" ||
-              "$threshold_valid" != "true"
-            ]]; then
-              jq -n \
-                --arg reference "$PREVIOUS_IMAGE_REFERENCE" \
-                --arg expectedDigest "$PREVIOUS_IMAGE_DIGEST" \
-                --arg registryDigest "$registry_digest" \
-                --argjson rollbackResolvable "$rollback_resolvable" \
-                --argjson enabled "$backup_enabled" \
-                --argjson accountConfigured "$account_configured" \
-                --argjson containerConfigured "$container_configured" \
-                --argjson thresholdValid "$threshold_valid" \
-                --arg staleThresholdHours "$stale_threshold" \
-                '{
-                  rollback: {
-                    imageReference: $reference,
-                    expectedDigest: $expectedDigest,
-                    registryDigest: $registryDigest,
-                    resolvable: $rollbackResolvable
-                  },
-                  offhostBackup: {
-                    enabled: $enabled,
-                    accountConfigured: $accountConfigured,
-                    containerConfigured: $containerConfigured,
-                    thresholdValid: $thresholdValid,
-                    staleThresholdHours:
-                      (if $thresholdValid then ($staleThresholdHours | tonumber) else null end),
-                    latestVerifiedBackup: null
-                  }
-                }' > evidence/recovery-precheck.json
-              exit 1
-            fi
-
-            blobs="$(
-              az storage blob list \
-                --auth-mode login \
-                --account-name "$backup_account" \
-                --container-name "$backup_container" \
-                --prefix "$backup_prefix" \
-                --num-results 5000 \
-                --only-show-errors \
-                --output json
+            stale_threshold="$(
+              jq -er '
+                (map({(.name): .value}) | add).OFFHOST_BACKUP_STALE_HOURS // "26" |
+                select(test("^[1-9][0-9]*$"))
+              ' <<<"$settings"
             )"
-            jq -e 'type == "array"' <<<"$blobs" > /dev/null
-            latest_manifest="$(
-              jq -c '
-                [
-                  .[] |
-                  select(
-                    ((.name | type) == "string") and
-                    (.name | endswith("/manifest.json")) and
-                    ((.properties.lastModified | type) == "string")
-                  )
-                ] |
-                sort_by(.properties.lastModified) |
-                last // empty
-              ' <<<"$blobs"
-            )"
-
-            if [[ -z "$latest_manifest" ]]; then
-              jq -n \
-                --arg reference "$PREVIOUS_IMAGE_REFERENCE" \
-                --arg expectedDigest "$PREVIOUS_IMAGE_DIGEST" \
-                --arg registryDigest "$registry_digest" \
-                --argjson rollbackResolvable "$rollback_resolvable" \
-                --argjson staleThresholdHours "$stale_threshold" \
-                '{
-                  rollback: {
-                    imageReference: $reference,
-                    expectedDigest: $expectedDigest,
-                    registryDigest: $registryDigest,
-                    resolvable: $rollbackResolvable
-                  },
-                  offhostBackup: {
-                    enabled: true,
-                    accountConfigured: true,
-                    containerConfigured: true,
-                    thresholdValid: true,
-                    staleThresholdHours: $staleThresholdHours,
-                    latestVerifiedBackup: null
-                  }
-                }' > evidence/recovery-precheck.json
-              exit 1
-            fi
-
-            manifest_blob="$(jq -r '.name' <<<"$latest_manifest")"
-            bundle_base="${manifest_blob%/manifest.json}"
-            snapshot_blob="$bundle_base/watchtower.sqlite3"
-            check_root="${RUNNER_TEMP:?}/watchtower-recovery-precheck-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            bundle_dir="$check_root/bundle"
-            restore_root="$check_root/restore"
-            mkdir -p "$bundle_dir" "$restore_root"
-            az storage blob download \
-              --auth-mode login \
-              --account-name "$backup_account" \
-              --container-name "$backup_container" \
-              --name "$manifest_blob" \
-              --file "$bundle_dir/manifest.json" \
-              --overwrite true \
-              --no-progress \
-              --only-show-errors \
-              --output none
-
+            curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" \
+              -H 'Cache-Control: no-cache' \
+              "$PRODUCTION_URL$READY_PATH?recovery-precheck=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              > evidence/recovery-precheck.raw
             jq -e '
               type == "object" and
-              .contract == "watchtower.sqlite-backup-manifest" and
-              .contractVersion == 1 and
-              .app == "watchtower" and
-              ((.bundleId | type) == "string") and
-              (.bundleId | test("^[0-9]{8}T[0-9]{9}Z-[0-9a-f]{16}$")) and
-              ((.createdUtc | type) == "string") and
-              .database.file == "watchtower.sqlite3" and
-              ((.database.bytes | type) == "number") and
-              .database.bytes > 0 and
-              ((.database.sha256 | type) == "string") and
-              (.database.sha256 | test("^[0-9a-f]{64}$")) and
-              .database.checks.quickCheck.ok == true and
-              .database.checks.integrityCheck.ok == true and
-              .database.checks.foreignKeyCheck.ok == true
-            ' "$bundle_dir/manifest.json" > /dev/null
-
-            bundle_id="$(jq -r '.bundleId' "$bundle_dir/manifest.json")"
-            case "$bundle_base" in
-              "$bundle_id"|*/"$bundle_id") ;;
-              *) exit 2 ;;
-            esac
-            created_utc="$(jq -r '.createdUtc' "$bundle_dir/manifest.json")"
-            age_seconds="$(
-              node --input-type=module --eval '
-                const created = Date.parse(process.argv[1]);
-                if (!Number.isFinite(created)) process.exit(2);
-                process.stdout.write(String(Math.floor((Date.now() - created) / 1000)));
-              ' "$created_utc"
-            )"
-            [[ "$age_seconds" =~ ^-?[0-9]+$ ]]
-
-            fresh=false
-            if (( age_seconds >= -300 && age_seconds <= stale_threshold * 3600 )); then
-              fresh=true
-            fi
-
-            if [[ "$fresh" != "true" ]]; then
-              jq -n \
-                --arg reference "$PREVIOUS_IMAGE_REFERENCE" \
-                --arg expectedDigest "$PREVIOUS_IMAGE_DIGEST" \
-                --arg registryDigest "$registry_digest" \
-                --argjson rollbackResolvable "$rollback_resolvable" \
-                --arg createdUtc "$created_utc" \
-                --argjson ageSeconds "$age_seconds" \
-                --argjson staleThresholdHours "$stale_threshold" \
-                '{
-                  rollback: {
-                    imageReference: $reference,
-                    expectedDigest: $expectedDigest,
-                    registryDigest: $registryDigest,
-                    resolvable: $rollbackResolvable
-                  },
-                  offhostBackup: {
-                    enabled: true,
-                    accountConfigured: true,
-                    containerConfigured: true,
-                    thresholdValid: true,
-                    staleThresholdHours: $staleThresholdHours,
-                    latestVerifiedBackup: {
-                      createdUtc: $createdUtc,
-                      ageSeconds: $ageSeconds,
-                      fresh: false,
-                      offhostReadBackVerified: false,
-                      localBundleVerified: false,
-                      disposableRestoreVerified: false
-                    }
-                  }
-                }' > evidence/recovery-precheck.json
-              exit 1
-            fi
-
-            az storage blob download \
-              --auth-mode login \
-              --account-name "$backup_account" \
-              --container-name "$backup_container" \
-              --name "$snapshot_blob" \
-              --file "$bundle_dir/watchtower.sqlite3" \
-              --overwrite true \
-              --no-progress \
-              --only-show-errors \
-              --output none
-            recovery_verification="$(
-              node --import tsx --input-type=module --eval '
-                import { restoreBundle, verifyBackup } from "./lib/recovery/index.ts";
-                const bundleDir = process.argv[1];
-                const restoreRoot = process.argv[2];
-                const verified = await verifyBackup({ bundleDir });
-                const restored = await restoreBundle({
-                  bundleDir,
-                  destination: `${restoreRoot}/watchtower.sqlite3`,
-                  allowedRoot: restoreRoot
-                });
-                process.stdout.write(JSON.stringify({
-                  offhostReadBackVerified: true,
-                  localBundleVerified:
-                    verified.identityMatches &&
-                    verified.tableCountsMatch &&
-                    verified.checks.quickCheck.ok &&
-                    verified.checks.integrityCheck.ok &&
-                    verified.checks.foreignKeyCheck.ok,
-                  disposableRestoreVerified:
-                    restored.identityMatches &&
-                    restored.tableCountsMatch &&
-                    restored.checks.quickCheck.ok &&
-                    restored.checks.integrityCheck.ok &&
-                    restored.checks.foreignKeyCheck.ok
-                }));
-              ' "$bundle_dir" "$restore_root"
-            )"
-            jq -e '
-              type == "object" and
-              .offhostReadBackVerified == true and
-              .localBundleVerified == true and
-              .disposableRestoreVerified == true
-            ' <<<"$recovery_verification" > /dev/null
-
-            jq -n \
+              ((.recovery | type) == "object") and
+              ((.recovery.enabled | type) == "boolean") and
+              ((.recovery.uploadConfigured | type) == "boolean") and
+              ((.recovery.restoreVerificationEnabled | type) == "boolean") and
+              (
+                .recovery.lastOutcome == null or
+                (
+                  ((.recovery.lastOutcome | type) == "object") and
+                  (.recovery.lastOutcome.status |
+                    . == "success" or . == "failed" or . == "skipped") and
+                  ((.recovery.lastOutcome.at | type) == "number") and
+                  .recovery.lastOutcome.at >= 0 and
+                  .recovery.lastOutcome.at == (.recovery.lastOutcome.at | floor)
+                )
+              )
+            ' evidence/recovery-precheck.raw > /dev/null
+            jq -e \
               --arg reference "$PREVIOUS_IMAGE_REFERENCE" \
               --arg expectedDigest "$PREVIOUS_IMAGE_DIGEST" \
               --arg registryDigest "$registry_digest" \
-              --argjson rollbackResolvable "$rollback_resolvable" \
-              --arg createdUtc "$created_utc" \
-              --argjson ageSeconds "$age_seconds" \
               --argjson staleThresholdHours "$stale_threshold" \
-              --argjson verification "$recovery_verification" \
+              --argjson nowMs "$(date +%s000)" \
               '{
                 rollback: {
                   imageReference: $reference,
                   expectedDigest: $expectedDigest,
                   registryDigest: $registryDigest,
-                  resolvable: $rollbackResolvable
+                  resolvable: ($registryDigest == $expectedDigest)
                 },
                 offhostBackup: {
-                  enabled: true,
-                  accountConfigured: true,
-                  containerConfigured: true,
-                  thresholdValid: true,
+                  enabled: .recovery.enabled,
+                  uploadConfigured: .recovery.uploadConfigured,
+                  restoreVerificationEnabled: .recovery.restoreVerificationEnabled,
                   staleThresholdHours: $staleThresholdHours,
-                  latestVerifiedBackup: {
-                    createdUtc: $createdUtc,
-                    ageSeconds: $ageSeconds,
-                    fresh: true,
-                    offhostReadBackVerified: $verification.offhostReadBackVerified,
-                    localBundleVerified: $verification.localBundleVerified,
-                    disposableRestoreVerified: $verification.disposableRestoreVerified
-                  }
+                  lastOutcome: (
+                    if .recovery.lastOutcome == null then null
+                    else {
+                      status: .recovery.lastOutcome.status,
+                      at: .recovery.lastOutcome.at,
+                      ageSeconds:
+                        ((($nowMs - .recovery.lastOutcome.at) / 1000) | floor),
+                      fresh:
+                        (($nowMs - .recovery.lastOutcome.at) >= -300000 and
+                        ($nowMs - .recovery.lastOutcome.at) <=
+                          ($staleThresholdHours * 3600000))
+                    }
+                    end
+                  )
                 }
-              }' > evidence/recovery-precheck.json
+              }' evidence/recovery-precheck.raw > evidence/recovery-precheck.json
             jq -e '
               .rollback.resolvable == true and
               .offhostBackup.enabled == true and
-              .offhostBackup.latestVerifiedBackup.fresh == true and
-              .offhostBackup.latestVerifiedBackup.offhostReadBackVerified == true and
-              .offhostBackup.latestVerifiedBackup.localBundleVerified == true and
-              .offhostBackup.latestVerifiedBackup.disposableRestoreVerified == true
+              .offhostBackup.uploadConfigured == true and
+              .offhostBackup.restoreVerificationEnabled == true and
+              .offhostBackup.lastOutcome.status == "success" and
+              .offhostBackup.lastOutcome.fresh == true
             ' evidence/recovery-precheck.json > /dev/null
 
       - name: Diagnostic — pre-activation readiness
+        id: readiness_diagnostic
         timeout-minutes: 2
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: readiness-precondition-precheck
@@ -808,10 +654,40 @@ jobs:
               ((.ok | type) == "boolean") and
               ((.lifecycle | type) == "string") and
               ((.authority | type) == "object") and
+              .authority.engine == "sqlite" and
+              .authority.path == "/home/data/watchtower.db" and
               ((.authority.journalMode | type) == "string") and
+              ((.authority.journalMode | ascii_downcase) == "delete") and
               ((.authority.schemaVersion | type) == "number") and
+              .authority.schemaVersion >= 0 and
+              .authority.schemaVersion == (.authority.schemaVersion | floor) and
+              ((.authority.migrationCount | type) == "number") and
+              .authority.migrationCount >= 0 and
+              .authority.migrationCount == (.authority.migrationCount | floor) and
+              ((.authority.migrationIdentityDigest | type) == "string") and
+              (.authority.migrationIdentityDigest | test("^[0-9a-f]{64}$")) and
+              ((.authority.ownedTableCount | type) == "number") and
+              .authority.ownedTableCount >= 0 and
+              .authority.ownedTableCount == (.authority.ownedTableCount | floor) and
+              ((.authority.requiredOwnedTableCount | type) == "number") and
+              .authority.requiredOwnedTableCount >= 0 and
+              .authority.requiredOwnedTableCount ==
+                (.authority.requiredOwnedTableCount | floor) and
+              .authority.ownedTableCount == .authority.requiredOwnedTableCount and
+              ((.authority.ownedSchemaDigest | type) == "string") and
+              (.authority.ownedSchemaDigest | test("^[0-9a-f]{64}$")) and
+              ((.authority.expectedOwnedSchemaDigest | type) == "string") and
+              (.authority.expectedOwnedSchemaDigest | test("^[0-9a-f]{64}$")) and
+              .authority.ownedSchemaDigest == .authority.expectedOwnedSchemaDigest and
               ((.workers | type) == "object") and
               (.workers | length) > 0 and
+              ([
+                "instance-lease",
+                "monitoring-archive",
+                "offhost-recovery",
+                "outage-postmortems",
+                "unifi-logs-backfill"
+              ] - (.workers | keys) | length) == 0 and
               ([.workers[] |
                 ((type == "object") and ((.state | type) == "string"))] |
                 all(.))
@@ -825,7 +701,9 @@ jobs:
             ' evidence/readiness-precheck.json > /dev/null
 
       - name: Diagnostic — monitoring resources
+        id: monitoring_diagnostic
         timeout-minutes: 2
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: monitoring-precheck
@@ -881,7 +759,9 @@ jobs:
             ' evidence/monitor-precheck.json > /dev/null
 
       - name: Diagnostic — protected configuration comparison
+        id: protected_configuration_diagnostic
         timeout-minutes: 2
+        continue-on-error: true
         uses: ./.github/actions/deployment-diagnostic
         with:
           check-id: protected-configuration-precheck
@@ -914,14 +794,54 @@ jobs:
               az webapp config appsettings list \
                 --resource-group "$RG" --name "$WEBAPP" --output json
             )"
-            setting_names="$(jq -c '[.[].name] | unique | sort' <<<"$settings")"
+            jq -e '
+              type == "object" and
+              ((.alwaysOn | type) == "boolean") and
+              ((.numberOfWorkers | type) == "number") and
+              ((.healthCheckPath | type) == "string") and
+              ((.linuxFxVersion | type) == "string")
+            ' <<<"$site" > /dev/null
+            jq -e 'type == "object" and ((.httpsOnly | type) == "boolean")' \
+              <<<"$webapp" > /dev/null
+            jq -e 'type == "object" and ((.type | type) == "string")' \
+              <<<"$identity" > /dev/null
+            jq -e '
+              type == "array" and
+              all(.[];
+                type == "object" and
+                ((.name | type) == "string") and
+                ((.value | type) == "string"))
+            ' <<<"$settings" > /dev/null
+            setting_values="$(jq -c '(map({(.name): .value}) | add) // {}' <<<"$settings")"
+            setting_names="$(jq -c 'keys | sort' <<<"$setting_values")"
+            setting_mismatches="$(
+              jq -cn --argjson actual "$setting_values" '
+                [
+                  { name: "ADMIN_OID", expected: "d6c36f6e-054c-45b8-9468-16c208628814" },
+                  { name: "AZURE_AD_AUDIENCE", expected: "55bf92db-2cec-4e65-ab0d-71bee90d7494" },
+                  { name: "AZURE_AD_CLIENT_ID", expected: "55bf92db-2cec-4e65-ab0d-71bee90d7494" },
+                  { name: "AZURE_AD_TENANT_ID", expected: "52188f12-db6b-46c6-88ff-08c802f0ed3b" },
+                  { name: "AZURE_DEFAULT_RESOURCE_GROUP", expected: "rg-personal-apps-prod" },
+                  { name: "BACKUP_ROOT", expected: "/home/data/backups/watchtower" },
+                  { name: "DB_PATH", expected: "/home/data/watchtower.db" },
+                  { name: "NODE_ENV", expected: "production" },
+                  { name: "PORT", expected: "3000" },
+                  { name: "SQLITE_JOURNAL_MODE", expected: "DELETE" },
+                  { name: "WEBSITES_ENABLE_APP_SERVICE_STORAGE", expected: "true" }
+                ] |
+                map(select($actual[.name] != .expected) | .name) |
+                sort
+              '
+            )"
             jq -n \
               --argjson site "$site" \
               --argjson webapp "$webapp" \
               --argjson identity "$identity" \
               --argjson settingNames "$setting_names" \
+              --argjson settingMismatches "$setting_mismatches" \
               '{
                 appSettingNames: $settingNames,
+                appSettingMismatches: $settingMismatches,
                 siteInvariants: {
                   alwaysOn: $site.alwaysOn,
                   numberOfWorkers: $site.numberOfWorkers,
@@ -938,14 +858,18 @@ jobs:
                 "AZURE_AD_AUDIENCE",
                 "AZURE_AD_CLIENT_ID",
                 "AZURE_AD_TENANT_ID",
+                "AZURE_DEFAULT_RESOURCE_GROUP",
                 "BACKUP_ROOT",
                 "BUILD_ID",
                 "BUILD_SHA",
                 "DB_PATH",
+                "NODE_ENV",
+                "PORT",
                 "SQLITE_JOURNAL_MODE",
                 "WEBSITES_ENABLE_APP_SERVICE_STORAGE"
               ] as $required |
               ($required - .appSettingNames | length) == 0 and
+              (.appSettingMismatches | length) == 0 and
               .siteInvariants.alwaysOn == true and
               .siteInvariants.numberOfWorkers == 1 and
               .siteInvariants.healthCheckPath == $healthCheckPath and
@@ -953,6 +877,114 @@ jobs:
               .siteInvariants.httpsOnly == true and
               (.siteInvariants.identity | contains("SystemAssigned"))
             ' evidence/config-fingerprint.json > /dev/null
+
+      - name: Record diagnostic wrapper execution failures
+        id: diagnostic_fallback
+        if: ${{ always() }}
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          SOURCE_DEPENDENCY_STATUS: ${{ steps.source_dependency_diagnostic.outputs.status }}
+          SOURCE_DEPENDENCY_OUTCOME: ${{ steps.source_dependency_diagnostic.outcome }}
+          SOURCE_SBOM_STATUS: ${{ steps.source_sbom_diagnostic.outputs.status }}
+          SOURCE_SBOM_OUTCOME: ${{ steps.source_sbom_diagnostic.outcome }}
+          IMAGE_SBOM_STATUS: ${{ steps.image_sbom_diagnostic.outputs.status }}
+          IMAGE_SBOM_OUTCOME: ${{ steps.image_sbom_diagnostic.outcome }}
+          IMAGE_SCAN_STATUS: ${{ steps.image_scan_diagnostic.outputs.status }}
+          IMAGE_SCAN_OUTCOME: ${{ steps.image_scan_diagnostic.outcome }}
+          SIGNATURE_STATUS: ${{ steps.signature_diagnostic.outputs.status }}
+          SIGNATURE_OUTCOME: ${{ steps.signature_diagnostic.outcome }}
+          PROVENANCE_STATUS: ${{ steps.provenance_diagnostic.outputs.status }}
+          PROVENANCE_OUTCOME: ${{ steps.provenance_diagnostic.outcome }}
+          MIGRATION_STATUS: ${{ steps.migration_diagnostic.outputs.status }}
+          MIGRATION_OUTCOME: ${{ steps.migration_diagnostic.outcome }}
+          RECOVERY_STATUS: ${{ steps.recovery_diagnostic.outputs.status }}
+          RECOVERY_OUTCOME: ${{ steps.recovery_diagnostic.outcome }}
+          READINESS_STATUS: ${{ steps.readiness_diagnostic.outputs.status }}
+          READINESS_OUTCOME: ${{ steps.readiness_diagnostic.outcome }}
+          MONITORING_STATUS: ${{ steps.monitoring_diagnostic.outputs.status }}
+          MONITORING_OUTCOME: ${{ steps.monitoring_diagnostic.outcome }}
+          PROTECTED_CONFIG_STATUS: ${{ steps.protected_configuration_diagnostic.outputs.status }}
+          PROTECTED_CONFIG_OUTCOME: ${{ steps.protected_configuration_diagnostic.outcome }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          failures=0
+
+          record_missing() {
+            local status="$1"
+            local outcome="$2"
+            local check_id="$3"
+            local category="$4"
+            local phase="$5"
+            local evidence_path="$6"
+            if [[ "$outcome" == "success" && -n "$status" ]]; then
+              return
+            fi
+
+            args=(
+              record
+              --check "$check_id"
+              --category "$category"
+              --phase "$phase"
+              --records "$DIAGNOSTIC_RECORDS"
+              --exit-code 127
+            )
+            if [[ -n "$evidence_path" ]]; then
+              args+=(--evidence "$evidence_path")
+            fi
+            if ! node scripts/deployment-diagnostic.mjs "${args[@]}"; then
+              echo "::warning title=Deployment diagnostics fallback::$check_id wrapper failed without a status, and its fallback record could not be written."
+              failures=1
+            fi
+          }
+
+          record_missing "$SOURCE_DEPENDENCY_STATUS" "$SOURCE_DEPENDENCY_OUTCOME" \
+            source-dependency-audit source-audit pre-build evidence/npm-audit.json
+          record_missing "$SOURCE_SBOM_STATUS" "$SOURCE_SBOM_OUTCOME" \
+            source-sbom sbom pre-build evidence/source-sbom.cdx.json
+          record_missing "$IMAGE_SBOM_STATUS" "$IMAGE_SBOM_OUTCOME" \
+            image-sbom sbom pre-activation evidence/image-sbom.spdx.json
+          record_missing "$IMAGE_SCAN_STATUS" "$IMAGE_SCAN_OUTCOME" \
+            image-vulnerability-scan image-scan pre-activation evidence/trivy-image.json
+          record_missing "$SIGNATURE_STATUS" "$SIGNATURE_OUTCOME" \
+            signature-verification signature-provenance pre-activation evidence/cosign-signature.json
+          record_missing "$PROVENANCE_STATUS" "$PROVENANCE_OUTCOME" \
+            provenance-attestation-verification signature-provenance pre-activation \
+            evidence/cosign-attestations.json
+          record_missing "$MIGRATION_STATUS" "$MIGRATION_OUTCOME" \
+            migration-compatibility-precheck migration-precondition pre-activation \
+            evidence/migration-compatibility.raw
+          record_missing "$RECOVERY_STATUS" "$RECOVERY_OUTCOME" \
+            recovery-precondition-precheck recovery-precondition pre-activation \
+            evidence/recovery-precheck.raw
+          record_missing "$READINESS_STATUS" "$READINESS_OUTCOME" \
+            readiness-precondition-precheck readiness-precondition pre-activation \
+            evidence/readiness-precheck.raw
+          record_missing "$MONITORING_STATUS" "$MONITORING_OUTCOME" \
+            monitoring-precheck monitoring-precheck pre-activation evidence/monitor-precheck.json
+          record_missing "$PROTECTED_CONFIG_STATUS" "$PROTECTED_CONFIG_OUTCOME" \
+            protected-configuration-precheck protected-configuration-precheck pre-activation \
+            evidence/config-fingerprint.json
+
+          exit "$failures"
+
+      - name: Warn when diagnostic fallback evidence cannot be written
+        if: ${{ always() && steps.diagnostic_fallback.outcome != 'success' }}
+        shell: bash
+        run: >-
+          echo "::warning title=Deployment diagnostics fallback::One or more
+          diagnostic wrappers failed without a status, and the best-effort
+          fallback evidence writer did not complete. Inspect the failed wrapper
+          annotations and logs."
+
+      - name: Refresh Azure login before production activation
+        timeout-minutes: 5
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
       - name: Arm rollback before production mutation
         shell: bash

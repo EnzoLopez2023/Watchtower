@@ -50,6 +50,18 @@ test("/api/live is process-only and /api/ready performs the bounded DB check", a
           }
         },
         workers: { status: () => ({ alertEngine: { state: "healthy", updatedAt: Date.now() } }) },
+        recovery: {
+          status: () => ({
+            enabled: true,
+            uploadConfigured: true,
+            restoreVerificationEnabled: true,
+            lastOutcome: {
+              status: "success",
+              at: 1_800_000_000_000,
+              durationMs: 12_345
+            }
+          })
+        },
         identities: new SqliteIdentityRepository(database),
         audit: new SqliteAuditRepository(database),
         settings: new SqliteSettingsRepository(database)
@@ -74,15 +86,39 @@ test("/api/live is process-only and /api/ready performs the bounded DB check", a
         authority: {
           journalMode: string;
           schemaVersion: number;
+          migrationCount: number;
+          migrationIdentityDigest: string;
           ownedTableCount: number;
           requiredOwnedTableCount: number;
+        };
+        recovery: {
+          enabled: boolean;
+          uploadConfigured: boolean;
+          restoreVerificationEnabled: boolean;
+          lastOutcome: {
+            status: string;
+            at: number;
+            durationMs: number | null;
+          } | null;
         };
       };
       assert.equal(body.ok, true);
       assert.equal(body.authority.journalMode, "delete");
       assert.equal(body.authority.schemaVersion, 2);
+      assert.equal(body.authority.migrationCount, 2);
+      assert.match(body.authority.migrationIdentityDigest, /^[0-9a-f]{64}$/);
       assert.equal(body.authority.ownedTableCount, 0);
       assert.equal(body.authority.requiredOwnedTableCount, 0);
+      assert.deepEqual(body.recovery, {
+        enabled: true,
+        uploadConfigured: true,
+        restoreVerificationEnabled: true,
+        lastOutcome: {
+          status: "success",
+          at: 1_800_000_000_000,
+          durationMs: 12_345
+        }
+      });
       assert.equal(readinessCalls, 1);
       assert.equal(authCalls, 0);
     });

@@ -1,6 +1,10 @@
 import type { SqliteDatabase } from "../connection.js";
 import { EXPECTED_OWNED_TABLES } from "../import/ownership.js";
 import { computeSchemaIdentity } from "../import/schema.js";
+import {
+  assertMigrationsComplete,
+  migrationIdentityDigest as digestMigrationIdentities
+} from "../migrate.js";
 
 export const PRODUCTION_OWNED_SCHEMA_DIGEST =
   "a1dfbe309137dd2e5598e695256fa64a955de6657480340eca4e894b5c9b10f7";
@@ -8,6 +12,8 @@ export const PRODUCTION_OWNED_SCHEMA_DIGEST =
 export interface DatabaseReadiness {
   readonly ok: boolean;
   readonly schemaVersion: number;
+  readonly migrationCount: number;
+  readonly migrationIdentityDigest: string;
   readonly journalMode: string;
   readonly ownedTableCount: number;
   readonly requiredOwnedTableCount: number;
@@ -30,6 +36,7 @@ export class SqliteReadinessRepository implements ReadinessRepository {
     const schema = this.database
       .prepare("SELECT coalesce(max(version), 0) AS version FROM schema_migrations")
       .get() as { version: number };
+    const migrations = assertMigrationsComplete(this.database);
     const ping = this.database.prepare("SELECT 1 AS ok").get() as { ok: number };
     const journalMode = String(this.database.pragma("journal_mode", { simple: true }));
     const schemaIdentity = computeSchemaIdentity(this.database, this.requiredTables);
@@ -44,6 +51,8 @@ export class SqliteReadinessRepository implements ReadinessRepository {
         ownedTableCount === this.requiredTables.length &&
         schemaMatches,
       schemaVersion: schema.version,
+      migrationCount: migrations.length,
+      migrationIdentityDigest: digestMigrationIdentities(migrations),
       journalMode,
       ownedTableCount,
       requiredOwnedTableCount: this.requiredTables.length,

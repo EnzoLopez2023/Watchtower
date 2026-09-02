@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -53,14 +54,18 @@ function diagnosticStep(checkId: string): string {
 }
 
 function diagnosticCommand(checkId: string): string {
-  const step = diagnosticStep(checkId);
-  const marker = "          run: |\n";
-  const start = step.indexOf(marker);
-  if (start === -1) throw new Error(`missing run command for diagnostic: ${checkId}`);
+  return runCommand(diagnosticStep(checkId));
+}
+
+function runCommand(step: string): string {
+  const match = /^(\s+)run: \|\n/m.exec(step);
+  if (!match || match.index === undefined) throw new Error("step has no run command");
+  const contentIndent = match[1]!.length + 2;
+  const prefix = " ".repeat(contentIndent);
   return step
-    .slice(start + marker.length)
+    .slice(match.index + match[0].length)
     .split("\n")
-    .map((line) => line.startsWith("            ") ? line.slice(12) : line)
+    .map((line) => line.startsWith(prefix) ? line.slice(contentIndent) : line)
     .join("\n");
 }
 
@@ -112,6 +117,7 @@ test("every applicable deployment check is bound to structured non-blocking evid
     const step = diagnosticStep(checkId);
     assert.match(step, /uses: \.\/\.github\/actions\/deployment-diagnostic/);
     assert.match(step, /records: \$\{\{ env\.DIAGNOSTIC_RECORDS \}\}/);
+    assert.match(step, /continue-on-error: true/);
     assert.ok(timeoutMinutes(step) > 0, `${checkId} must have a step timeout`);
   }
   assert.doesNotMatch(workflow, /^\s+mode:\s*skip\s*$/m);
@@ -223,6 +229,7 @@ test("diagnostic runtime is bounded without consuming the deployment operation b
     + timeoutMinutes(namedStep("Generate exact-image SBOM"))
     + timeoutMinutes(namedStep("Scan exact image for HIGH and CRITICAL vulnerabilities"))
     + timeoutMinutes(namedStep("Install Cosign"))
+    + timeoutMinutes(namedStep("Record diagnostic wrapper execution failures"))
     + timeoutMinutes(namedStep("Upload nonsecret deployment and diagnostic evidence"));
 
   assert.ok(diagnosticBudget <= 75, `diagnostics can consume ${diagnosticBudget} minutes`);
@@ -239,6 +246,7 @@ test("deployment operations, post-activation verification, and rollback remain b
     "Azure login with OIDC",
     "Capture prior release",
     "Build, push, and inspect digest-pinned candidate",
+    "Refresh Azure login before production activation",
     "Arm rollback before production mutation",
     "Activate inspected digest as production release",
     "Verify the new digest is the live release",
@@ -273,6 +281,16 @@ test("deployment operations, post-activation verification, and rollback remain b
   );
   assert.match(rollback, /\[\[ "\$restored" -ge 3 \]\]/);
   assert.doesNotMatch(workflow, /^\s+needs:/m);
+
+  const refresh = namedStep("Refresh Azure login before production activation");
+  assert.match(
+    refresh,
+    /uses: azure\/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6/
+  );
+  assert.ok(
+    workflow.indexOf("Refresh Azure login before production activation") <
+      workflow.indexOf("Arm rollback before production mutation")
+  );
 });
 
 test("deployment evidence reports actual supply-chain diagnostic outcomes", () => {
@@ -291,22 +309,21 @@ test("deployment evidence reports actual supply-chain diagnostic outcomes", () =
 
 test("recovery freshness and the custom-container invariant remain real checks", () => {
   const recovery = diagnosticStep("recovery-precondition-precheck");
-  assert.match(recovery, /az storage blob list/);
-  assert.match(recovery, /--auth-mode login/);
-  assert.match(recovery, /az storage blob download/);
-  assert.match(recovery, /watchtower\.sqlite-backup-manifest/);
-  assert.match(recovery, /stale_threshold \* 3600/);
-  assert.match(recovery, /import \{ restoreBundle, verifyBackup \}/);
-  assert.match(recovery, /offhostReadBackVerified/);
-  assert.match(recovery, /localBundleVerified/);
-  assert.match(recovery, /disposableRestoreVerified/);
+  assert.match(recovery, /\$PRODUCTION_URL\$READY_PATH\?recovery-precheck=/);
+  assert.match(recovery, /\.recovery\.uploadConfigured/);
+  assert.match(recovery, /\.recovery\.restoreVerificationEnabled/);
+  assert.match(recovery, /\.offhostBackup\.lastOutcome\.status == "success"/);
+  assert.match(recovery, /staleThresholdHours \* 3600000/);
+  assert.doesNotMatch(recovery, /az storage|blob\.core\.windows\.net/);
 
   const configuration = diagnosticStep("protected-configuration-precheck");
   assert.match(configuration, /linuxFxVersion:linuxFxVersion/);
   assert.match(configuration, /customContainerConfigured:/);
   assert.match(configuration, /startswith\("DOCKER\|"\)/);
+  assert.match(configuration, /appSettingMismatches:/);
+  assert.match(configuration, /map\(select\(\$actual\[\.name\] != \.expected\) \| \.name\)/);
+  assert.match(configuration, /\(\.appSettingMismatches \| length\) == 0/);
   assert.match(configuration, /\.siteInvariants\.customContainerConfigured == true/);
-  assert.doesNotMatch(configuration, /\.value\b/);
 });
 
 test("aggregation and upload are best-effort, always-run, and loudly annotated", () => {
@@ -343,6 +360,7 @@ function runPrecheck(args: {
   readonly response: unknown;
   readonly report: string;
   readonly raw: string;
+  readonly nodeResponse?: unknown;
 }): {
   readonly status: number | null;
   readonly reportExists: boolean;
@@ -357,7 +375,7 @@ function runPrecheck(args: {
     const curl = join(bin, "curl");
     const node = join(bin, "node");
     writeFileSync(curl, "#!/bin/sh\nprintf '%s\\n' \"$FAKE_RESPONSE\"\n");
-    writeFileSync(node, "#!/bin/sh\nprintf '2'\n");
+    writeFileSync(node, "#!/bin/sh\nprintf '%s' \"$FAKE_NODE_RESPONSE\"\n");
     chmodSync(curl, 0o755);
     chmodSync(node, 0o755);
 
@@ -366,6 +384,7 @@ function runPrecheck(args: {
       encoding: "utf8",
       env: {
         FAKE_RESPONSE: JSON.stringify(args.response),
+        FAKE_NODE_RESPONSE: JSON.stringify(args.nodeResponse ?? {}),
         GITHUB_RUN_ATTEMPT: "1",
         GITHUB_RUN_ID: "1",
         HTTP_TIMEOUT_SECONDS: "8",
@@ -386,7 +405,7 @@ function runPrecheck(args: {
   }
 }
 
-test("migration and readiness prechecks reject incomplete response shapes before reporting", () => {
+test("migration and readiness prechecks reject incomplete or contradictory authority responses", () => {
   const malformedMigration = runPrecheck({
     checkId: "migration-compatibility-precheck",
     response: { ok: true, authority: { schemaVersion: 2 } },
@@ -397,22 +416,57 @@ test("migration and readiness prechecks reject incomplete response shapes before
   assert.equal(malformedMigration.rawExists, true);
   assert.equal(malformedMigration.reportExists, false);
 
-  const digest = "a".repeat(64);
+  const schemaDigest = "a".repeat(64);
+  const migrationDigest = "b".repeat(64);
   const validMigration = runPrecheck({
     checkId: "migration-compatibility-precheck",
     response: {
       ok: true,
       authority: {
         schemaVersion: 2,
-        ownedSchemaDigest: digest,
-        expectedOwnedSchemaDigest: digest
+        migrationCount: 2,
+        migrationIdentityDigest: migrationDigest,
+        ownedSchemaDigest: schemaDigest,
+        expectedOwnedSchemaDigest: schemaDigest
       }
     },
     report: "evidence/migration-compatibility.json",
-    raw: "evidence/migration-compatibility.raw"
+    raw: "evidence/migration-compatibility.raw",
+    nodeResponse: {
+      maxMigrationVersion: 2,
+      migrationCount: 2,
+      fullIdentityDigest: migrationDigest,
+      appliedPrefixIdentityDigest: migrationDigest,
+      prefixAvailable: true
+    }
   });
   assert.equal(validMigration.status, 0, validMigration.stderr);
   assert.equal(validMigration.reportExists, true);
+
+  const driftedMigration = runPrecheck({
+    checkId: "migration-compatibility-precheck",
+    response: {
+      ok: true,
+      authority: {
+        schemaVersion: 2,
+        migrationCount: 2,
+        migrationIdentityDigest: "c".repeat(64),
+        ownedSchemaDigest: schemaDigest,
+        expectedOwnedSchemaDigest: schemaDigest
+      }
+    },
+    report: "evidence/migration-compatibility.json",
+    raw: "evidence/migration-compatibility.raw",
+    nodeResponse: {
+      maxMigrationVersion: 2,
+      migrationCount: 2,
+      fullIdentityDigest: migrationDigest,
+      appliedPrefixIdentityDigest: migrationDigest,
+      prefixAvailable: true
+    }
+  });
+  assert.notEqual(driftedMigration.status, 0, driftedMigration.stderr);
+  assert.equal(driftedMigration.reportExists, true);
 
   const malformedReadiness = runPrecheck({
     checkId: "readiness-precondition-precheck",
@@ -429,22 +483,355 @@ test("migration and readiness prechecks reject incomplete response shapes before
     response: {
       ok: true,
       lifecycle: "ready",
-      authority: { journalMode: "delete", schemaVersion: 2 },
-      workers: { instanceLease: { state: "healthy" } }
+      authority: {
+        engine: "sqlite",
+        path: "/home/data/watchtower.db",
+        journalMode: "delete",
+        schemaVersion: 2,
+        migrationCount: 2,
+        migrationIdentityDigest: migrationDigest,
+        ownedTableCount: 54,
+        requiredOwnedTableCount: 54,
+        ownedSchemaDigest: schemaDigest,
+        expectedOwnedSchemaDigest: schemaDigest
+      },
+      workers: {
+        "instance-lease": { state: "healthy" },
+        "monitoring-archive": { state: "healthy" },
+        "offhost-recovery": { state: "healthy" },
+        "outage-postmortems": { state: "healthy" },
+        "unifi-logs-backfill": { state: "healthy" }
+      }
     },
     report: "evidence/readiness-precheck.json",
     raw: "evidence/readiness-precheck.raw"
   });
   assert.equal(validReadiness.status, 0, validReadiness.stderr);
   assert.equal(validReadiness.reportExists, true);
+
+  const contradictoryReadiness = runPrecheck({
+    checkId: "readiness-precondition-precheck",
+    response: {
+      ok: true,
+      lifecycle: "ready",
+      authority: {
+        engine: "sqlite",
+        path: "/home/data/watchtower.db",
+        journalMode: "WAL",
+        schemaVersion: -1.5,
+        migrationCount: 2,
+        migrationIdentityDigest: migrationDigest,
+        ownedTableCount: 54,
+        requiredOwnedTableCount: 54,
+        ownedSchemaDigest: schemaDigest,
+        expectedOwnedSchemaDigest: schemaDigest
+      },
+      workers: {
+        "instance-lease": { state: "stopped" },
+        "monitoring-archive": { state: "stopped" },
+        "offhost-recovery": { state: "stopped" },
+        "outage-postmortems": { state: "stopped" },
+        "unifi-logs-backfill": { state: "stopped" }
+      }
+    },
+    report: "evidence/readiness-precheck.json",
+    raw: "evidence/readiness-precheck.raw"
+  });
+  assert.notEqual(contradictoryReadiness.status, 0, contradictoryReadiness.stderr);
+  assert.equal(contradictoryReadiness.reportExists, false);
+});
+
+function runRecoveryPrecheck(response: unknown): {
+  readonly status: number | null;
+  readonly reportExists: boolean;
+  readonly rawExists: boolean;
+  readonly report?: {
+    readonly offhostBackup: {
+      readonly lastOutcome: { readonly fresh: boolean } | null;
+    };
+  };
+  readonly stderr: string;
+} {
+  const directory = mkdtempSync(join(tmpdir(), "watchtower-recovery-check-"));
+  try {
+    const bin = join(directory, "bin");
+    mkdirSync(bin);
+    mkdirSync(join(directory, "evidence"));
+    const az = join(bin, "az");
+    const curl = join(bin, "curl");
+    writeFileSync(
+      az,
+      `#!/bin/sh
+case "$*" in
+  *"acr repository show"*) printf '%s\\n' "$FAKE_DIGEST" ;;
+  *"webapp config appsettings list"*) printf '%s\\n' "$FAKE_SETTINGS" ;;
+  *) exit 2 ;;
+esac
+`
+    );
+    writeFileSync(curl, "#!/bin/sh\nprintf '%s\\n' \"$FAKE_RESPONSE\"\n");
+    chmodSync(az, 0o755);
+    chmodSync(curl, 0o755);
+    const digest = `sha256:${"a".repeat(64)}`;
+    const result = spawnSync(
+      "bash",
+      ["-c", diagnosticCommand("recovery-precondition-precheck")],
+      {
+        cwd: directory,
+        encoding: "utf8",
+        env: {
+          ACR: "acrenzolopez01",
+          FAKE_DIGEST: digest,
+          FAKE_RESPONSE: JSON.stringify(response),
+          FAKE_SETTINGS: JSON.stringify([
+            { name: "OFFHOST_BACKUP_STALE_HOURS", value: "26" }
+          ]),
+          GITHUB_RUN_ATTEMPT: "1",
+          GITHUB_RUN_ID: "1",
+          HTTP_TIMEOUT_SECONDS: "8",
+          IMAGE_REPOSITORY: "watchtower",
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          PREVIOUS_IMAGE_DIGEST: digest,
+          PREVIOUS_IMAGE_REFERENCE: `acrenzolopez01.azurecr.io/watchtower@${digest}`,
+          PRODUCTION_URL: "https://watchtower.example",
+          READY_PATH: "/api/ready",
+          RG: "rg-personal-apps-prod",
+          WEBAPP: "app-watchtower-prod"
+        }
+      }
+    );
+    assert.equal(result.error, undefined);
+    const reportPath = join(directory, "evidence/recovery-precheck.json");
+    return {
+      status: result.status,
+      reportExists: existsSync(reportPath),
+      rawExists: existsSync(join(directory, "evidence/recovery-precheck.raw")),
+      ...(existsSync(reportPath)
+        ? {
+            report: JSON.parse(readFileSync(reportPath, "utf8")) as {
+              readonly offhostBackup: {
+                readonly lastOutcome: { readonly fresh: boolean } | null;
+              };
+            }
+          }
+        : {}),
+      stderr: result.stderr
+    };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test("recovery precheck trusts only a fresh successful in-app verify-and-restore outcome", () => {
+  const healthy = runRecoveryPrecheck({
+    recovery: {
+      enabled: true,
+      uploadConfigured: true,
+      restoreVerificationEnabled: true,
+      lastOutcome: {
+        status: "success",
+        at: Date.now(),
+        durationMs: 12_345
+      }
+    }
+  });
+  assert.equal(healthy.status, 0, healthy.stderr);
+  assert.equal(healthy.report?.offhostBackup.lastOutcome?.fresh, true);
+
+  const stale = runRecoveryPrecheck({
+    recovery: {
+      enabled: true,
+      uploadConfigured: true,
+      restoreVerificationEnabled: true,
+      lastOutcome: {
+        status: "success",
+        at: Date.now() - 27 * 60 * 60 * 1000,
+        durationMs: 12_345
+      }
+    }
+  });
+  assert.notEqual(stale.status, 0, stale.stderr);
+  assert.equal(stale.report?.offhostBackup.lastOutcome?.fresh, false);
+
+  const missingOutcome = runRecoveryPrecheck({ ok: true });
+  assert.notEqual(missingOutcome.status, 0, missingOutcome.stderr);
+  assert.equal(missingOutcome.rawExists, true);
+  assert.equal(missingOutcome.reportExists, false);
+});
+
+function runProtectedConfiguration(settings: readonly {
+  readonly name: string;
+  readonly value: string;
+}[]): {
+  readonly status: number | null;
+  readonly report: {
+    readonly appSettingNames: readonly string[];
+    readonly appSettingMismatches: readonly string[];
+  };
+  readonly stderr: string;
+} {
+  const directory = mkdtempSync(join(tmpdir(), "watchtower-config-check-"));
+  try {
+    const bin = join(directory, "bin");
+    mkdirSync(bin);
+    mkdirSync(join(directory, "evidence"));
+    const az = join(bin, "az");
+    writeFileSync(
+      az,
+      `#!/bin/sh
+case "$*" in
+  *"webapp config appsettings list"*) printf '%s\\n' "$FAKE_SETTINGS" ;;
+  *"webapp config show"*) printf '%s\\n' "$FAKE_SITE" ;;
+  *"webapp identity show"*) printf '%s\\n' "$FAKE_IDENTITY" ;;
+  *"webapp show"*) printf '%s\\n' "$FAKE_WEBAPP" ;;
+  *) exit 2 ;;
+esac
+`
+    );
+    chmodSync(az, 0o755);
+    const result = spawnSync(
+      "bash",
+      ["-c", diagnosticCommand("protected-configuration-precheck")],
+      {
+        cwd: directory,
+        encoding: "utf8",
+        env: {
+          FAKE_IDENTITY: JSON.stringify({ type: "SystemAssigned" }),
+          FAKE_SETTINGS: JSON.stringify(settings),
+          FAKE_SITE: JSON.stringify({
+            alwaysOn: true,
+            numberOfWorkers: 1,
+            healthCheckPath: "/api/live",
+            linuxFxVersion: "DOCKER|acrenzolopez01.azurecr.io/watchtower@sha256:abc"
+          }),
+          FAKE_WEBAPP: JSON.stringify({ httpsOnly: true }),
+          LIVE_PATH: "/api/live",
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          RG: "rg-personal-apps-prod",
+          WEBAPP: "app-watchtower-prod"
+        }
+      }
+    );
+    assert.equal(result.error, undefined);
+    return {
+      status: result.status,
+      report: JSON.parse(
+        readFileSync(join(directory, "evidence/config-fingerprint.json"), "utf8")
+      ) as {
+        readonly appSettingNames: readonly string[];
+        readonly appSettingMismatches: readonly string[];
+      },
+      stderr: result.stderr
+    };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test("protected configuration compares values in memory but reports names only", () => {
+  const settings = [
+    { name: "ADMIN_OID", value: "d6c36f6e-054c-45b8-9468-16c208628814" },
+    { name: "AZURE_AD_AUDIENCE", value: "55bf92db-2cec-4e65-ab0d-71bee90d7494" },
+    { name: "AZURE_AD_CLIENT_ID", value: "55bf92db-2cec-4e65-ab0d-71bee90d7494" },
+    { name: "AZURE_AD_TENANT_ID", value: "52188f12-db6b-46c6-88ff-08c802f0ed3b" },
+    { name: "AZURE_DEFAULT_RESOURCE_GROUP", value: "rg-personal-apps-prod" },
+    { name: "BACKUP_ROOT", value: "/home/data/backups/watchtower" },
+    { name: "BUILD_ID", value: "1-1" },
+    { name: "BUILD_SHA", value: "a".repeat(40) },
+    { name: "DB_PATH", value: "/home/data/watchtower.db" },
+    { name: "NODE_ENV", value: "production" },
+    { name: "PORT", value: "3000" },
+    { name: "SQLITE_JOURNAL_MODE", value: "DELETE" },
+    { name: "WEBSITES_ENABLE_APP_SERVICE_STORAGE", value: "true" }
+  ];
+  const valid = runProtectedConfiguration(settings);
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.deepEqual(valid.report.appSettingMismatches, []);
+
+  const wrongPath = "/tmp/ephemeral-watchtower.db";
+  const mismatched = runProtectedConfiguration(
+    settings.map((setting) =>
+      setting.name === "DB_PATH" ? { ...setting, value: wrongPath } : setting
+    )
+  );
+  assert.notEqual(mismatched.status, 0, mismatched.stderr);
+  assert.deepEqual(mismatched.report.appSettingMismatches, ["DB_PATH"]);
+  const serialized = JSON.stringify(mismatched.report);
+  assert.doesNotMatch(serialized, /ephemeral-watchtower|\/home\/data\/watchtower\.db/);
 });
 
 interface DiagnosticRecord {
   readonly control_effect: string;
+  readonly check_id?: string;
   readonly status: string;
   readonly exit_code: number | null;
   readonly execution_error?: string;
 }
+
+test("an outer wrapper failure gets an execution-failure record before activation", () => {
+  const fallback = namedStep("Record diagnostic wrapper execution failures");
+  assert.match(fallback, /if: \$\{\{ always\(\) \}\}/);
+  assert.match(fallback, /continue-on-error: true/);
+  assert.match(fallback, /--exit-code 127/);
+  assert.match(
+    namedStep("Warn when diagnostic fallback evidence cannot be written"),
+    /::warning title=Deployment diagnostics fallback::/
+  );
+
+  const directory = mkdtempSync(join(tmpdir(), "watchtower-wrapper-fallback-"));
+  try {
+    mkdirSync(join(directory, "scripts"));
+    copyFileSync(HELPER_PATH, join(directory, "scripts/deployment-diagnostic.mjs"));
+    const env: NodeJS.ProcessEnv = {
+      DIAGNOSTIC_RECORDS: "records.jsonl",
+      GITHUB_JOB: "test",
+      GITHUB_OUTPUT: join(directory, "outputs.txt"),
+      GITHUB_REF: "refs/heads/test",
+      GITHUB_REPOSITORY: "EnzoLopez2023/Watchtower",
+      GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_RUN_ID: "1",
+      GITHUB_SHA: "a".repeat(40),
+      GITHUB_STEP_SUMMARY: join(directory, "summary.md"),
+      PATH: process.env.PATH ?? ""
+    };
+    for (const prefix of [
+      "SOURCE_DEPENDENCY",
+      "SOURCE_SBOM",
+      "IMAGE_SBOM",
+      "IMAGE_SCAN",
+      "SIGNATURE",
+      "PROVENANCE",
+      "MIGRATION",
+      "RECOVERY",
+      "READINESS",
+      "MONITORING",
+      "PROTECTED_CONFIG"
+    ]) {
+      env[`${prefix}_STATUS`] = "pass";
+      env[`${prefix}_OUTCOME`] = "success";
+    }
+    env.SOURCE_DEPENDENCY_STATUS = "";
+    env.SOURCE_DEPENDENCY_OUTCOME = "failure";
+
+    const result = spawnSync(
+      "bash",
+      ["-c", runCommand(fallback)],
+      { cwd: directory, encoding: "utf8", env }
+    );
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    const records = readFileSync(join(directory, "records.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as DiagnosticRecord);
+    assert.equal(records.length, 1);
+    assert.equal(records[0]?.check_id, "source-dependency-audit");
+    assert.equal(records[0]?.status, "execution-failure");
+    assert.match(records[0]?.execution_error ?? "", /exit 127/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 function recordResult(args: {
   readonly report: string;
