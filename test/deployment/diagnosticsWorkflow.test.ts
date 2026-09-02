@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -12,7 +15,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-const REVIEWED_HEAD = "3b5bc3bfd2ed84a87f19f6fbe77074bd850cd5d1";
+const REVIEWED_HEAD = "f45790e9df7c9fabbc53dd04e6055a59d6f28f39";
 const WORKFLOW_PATH = fileURLToPath(
   new URL("../../.github/workflows/deploy.yml", import.meta.url)
 );
@@ -49,8 +52,26 @@ function diagnosticStep(checkId: string): string {
   return workflow.slice(start + 1, next === -1 ? undefined : next);
 }
 
+function diagnosticCommand(checkId: string): string {
+  const step = diagnosticStep(checkId);
+  const marker = "          run: |\n";
+  const start = step.indexOf(marker);
+  if (start === -1) throw new Error(`missing run command for diagnostic: ${checkId}`);
+  return step
+    .slice(start + marker.length)
+    .split("\n")
+    .map((line) => line.startsWith("            ") ? line.slice(12) : line)
+    .join("\n");
+}
+
+function timeoutMinutes(step: string): number {
+  const match = /^\s+timeout-minutes:\s*(\d+)\s*$/m.exec(step);
+  if (!match) throw new Error("step has no timeout-minutes");
+  return Number(match[1]);
+}
+
 test("the deployment diagnostics artifacts are byte-identical to the reviewed contract", () => {
-  assert.equal(REVIEWED_HEAD, "3b5bc3bfd2ed84a87f19f6fbe77074bd850cd5d1");
+  assert.equal(REVIEWED_HEAD, "f45790e9df7c9fabbc53dd04e6055a59d6f28f39");
   assert.equal(
     gitBlobSha(HELPER_PATH),
     "d31a00faad5832832bf0b91e96387f5f77645700",
@@ -91,6 +112,7 @@ test("every applicable deployment check is bound to structured non-blocking evid
     const step = diagnosticStep(checkId);
     assert.match(step, /uses: \.\/\.github\/actions\/deployment-diagnostic/);
     assert.match(step, /records: \$\{\{ env\.DIAGNOSTIC_RECORDS \}\}/);
+    assert.ok(timeoutMinutes(step) > 0, `${checkId} must have a step timeout`);
   }
   assert.doesNotMatch(workflow, /^\s+mode:\s*skip\s*$/m);
   assert.doesNotMatch(workflow, /\.trivyignore|--ignorefile|--skip-(scan|audit|sbom|verify)/i);
@@ -117,6 +139,7 @@ test("existing dependency, SBOM, scanner, and Cosign strength is unchanged", () 
     /uses: anchore\/sbom-action@e22c389904149dbc22b58101806040fa8d37a610/
   );
   assert.match(imageSbom, /continue-on-error: true/);
+  assert.equal(timeoutMinutes(imageSbom), 5);
   assert.match(imageSbom, /image: \$\{\{ steps\.image\.outputs\.ref \}\}/);
   assert.match(imageSbom, /format: spdx-json/);
   assert.match(imageSbom, /output-file: evidence\/image-sbom\.spdx\.json/);
@@ -138,6 +161,7 @@ test("existing dependency, SBOM, scanner, and Cosign strength is unchanged", () 
     /uses: aquasecurity\/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25/
   );
   assert.match(imageScan, /continue-on-error: true/);
+  assert.equal(timeoutMinutes(imageScan), 12);
   assert.match(imageScan, /image-ref: \$\{\{ steps\.image\.outputs\.ref \}\}/);
   assert.match(imageScan, /format: json/);
   assert.match(imageScan, /output: evidence\/trivy-image\.json/);
@@ -154,6 +178,7 @@ test("existing dependency, SBOM, scanner, and Cosign strength is unchanged", () 
     /uses: sigstore\/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6/
   );
   assert.match(cosignInstall, /continue-on-error: true/);
+  assert.equal(timeoutMinutes(cosignInstall), 3);
 
   const signature = diagnosticStep("signature-verification");
   assert.match(signature, /cosign sign --yes "\$IMAGE_REFERENCE"/);
@@ -175,6 +200,34 @@ test("existing dependency, SBOM, scanner, and Cosign strength is unchanged", () 
   );
   assert.match(attestations, /cosign verify-attestation --type slsaprovenance1/);
   assert.match(attestations, /cosign verify-attestation --type spdxjson/);
+});
+
+test("diagnostic runtime is bounded without consuming the deployment operation budget", () => {
+  const checkIds = [
+    "aggregate",
+    "image-sbom",
+    "image-vulnerability-scan",
+    "migration-compatibility-precheck",
+    "monitoring-precheck",
+    "protected-configuration-precheck",
+    "provenance-attestation-verification",
+    "readiness-precondition-precheck",
+    "recovery-precondition-precheck",
+    "signature-verification",
+    "source-dependency-audit",
+    "source-sbom"
+  ];
+  const diagnosticBudget = checkIds
+    .map((checkId) => timeoutMinutes(diagnosticStep(checkId)))
+    .reduce((sum, timeout) => sum + timeout, 0)
+    + timeoutMinutes(namedStep("Generate exact-image SBOM"))
+    + timeoutMinutes(namedStep("Scan exact image for HIGH and CRITICAL vulnerabilities"))
+    + timeoutMinutes(namedStep("Install Cosign"))
+    + timeoutMinutes(namedStep("Upload nonsecret deployment and diagnostic evidence"));
+
+  assert.ok(diagnosticBudget <= 75, `diagnostics can consume ${diagnosticBudget} minutes`);
+  assert.match(workflow, /^\s{4}timeout-minutes: 120$/m);
+  assert.ok(120 >= 40 + diagnosticBudget, "the original 40-minute operation budget is preserved");
 });
 
 test("deployment operations, post-activation verification, and rollback remain blocking", () => {
@@ -222,6 +275,40 @@ test("deployment operations, post-activation verification, and rollback remain b
   assert.doesNotMatch(workflow, /^\s+needs:/m);
 });
 
+test("deployment evidence reports actual supply-chain diagnostic outcomes", () => {
+  const evidence = namedStep("Record deployment evidence");
+  assert.match(evidence, /SIGNATURE_DIAGNOSTIC_STATUS:/);
+  assert.match(evidence, /PROVENANCE_DIAGNOSTIC_STATUS:/);
+  assert.match(evidence, /signed: \(\$signatureStatus == "pass"\)/);
+  assert.match(evidence, /provenanceAttested: \(\$provenanceStatus == "pass"\)/);
+  assert.match(evidence, /sbomAttested: \(\$provenanceStatus == "pass"\)/);
+  assert.match(evidence, /supplyChainDiagnostics:/);
+  assert.doesNotMatch(
+    evidence,
+    /signed:\s*true|provenanceAttested:\s*true|sbomAttested:\s*true/
+  );
+});
+
+test("recovery freshness and the custom-container invariant remain real checks", () => {
+  const recovery = diagnosticStep("recovery-precondition-precheck");
+  assert.match(recovery, /az storage blob list/);
+  assert.match(recovery, /--auth-mode login/);
+  assert.match(recovery, /az storage blob download/);
+  assert.match(recovery, /watchtower\.sqlite-backup-manifest/);
+  assert.match(recovery, /stale_threshold \* 3600/);
+  assert.match(recovery, /import \{ restoreBundle, verifyBackup \}/);
+  assert.match(recovery, /offhostReadBackVerified/);
+  assert.match(recovery, /localBundleVerified/);
+  assert.match(recovery, /disposableRestoreVerified/);
+
+  const configuration = diagnosticStep("protected-configuration-precheck");
+  assert.match(configuration, /linuxFxVersion:linuxFxVersion/);
+  assert.match(configuration, /customContainerConfigured:/);
+  assert.match(configuration, /startswith\("DOCKER\|"\)/);
+  assert.match(configuration, /\.siteInvariants\.customContainerConfigured == true/);
+  assert.doesNotMatch(configuration, /\.value\b/);
+});
+
 test("aggregation and upload are best-effort, always-run, and loudly annotated", () => {
   const aggregate = namedStep("Aggregate deployment diagnostics");
   assert.match(aggregate, /if: \$\{\{ always\(\) \}\}/);
@@ -249,6 +336,107 @@ test("aggregation and upload are best-effort, always-run, and loudly annotated",
     namedStep("Warn when deployment evidence cannot be uploaded"),
     /::warning title=Deployment diagnostics upload::/
   );
+});
+
+function runPrecheck(args: {
+  readonly checkId: string;
+  readonly response: unknown;
+  readonly report: string;
+  readonly raw: string;
+}): {
+  readonly status: number | null;
+  readonly reportExists: boolean;
+  readonly rawExists: boolean;
+  readonly stderr: string;
+} {
+  const directory = mkdtempSync(join(tmpdir(), "watchtower-precheck-"));
+  try {
+    const bin = join(directory, "bin");
+    mkdirSync(bin);
+    mkdirSync(join(directory, "evidence"));
+    const curl = join(bin, "curl");
+    const node = join(bin, "node");
+    writeFileSync(curl, "#!/bin/sh\nprintf '%s\\n' \"$FAKE_RESPONSE\"\n");
+    writeFileSync(node, "#!/bin/sh\nprintf '2'\n");
+    chmodSync(curl, 0o755);
+    chmodSync(node, 0o755);
+
+    const result = spawnSync("bash", ["-c", diagnosticCommand(args.checkId)], {
+      cwd: directory,
+      encoding: "utf8",
+      env: {
+        FAKE_RESPONSE: JSON.stringify(args.response),
+        GITHUB_RUN_ATTEMPT: "1",
+        GITHUB_RUN_ID: "1",
+        HTTP_TIMEOUT_SECONDS: "8",
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        PRODUCTION_URL: "https://watchtower.example",
+        READY_PATH: "/api/ready"
+      }
+    });
+    assert.equal(result.error, undefined);
+    return {
+      status: result.status,
+      reportExists: existsSync(join(directory, args.report)),
+      rawExists: existsSync(join(directory, args.raw)),
+      stderr: result.stderr
+    };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test("migration and readiness prechecks reject incomplete response shapes before reporting", () => {
+  const malformedMigration = runPrecheck({
+    checkId: "migration-compatibility-precheck",
+    response: { ok: true, authority: { schemaVersion: 2 } },
+    report: "evidence/migration-compatibility.json",
+    raw: "evidence/migration-compatibility.raw"
+  });
+  assert.notEqual(malformedMigration.status, 0, malformedMigration.stderr);
+  assert.equal(malformedMigration.rawExists, true);
+  assert.equal(malformedMigration.reportExists, false);
+
+  const digest = "a".repeat(64);
+  const validMigration = runPrecheck({
+    checkId: "migration-compatibility-precheck",
+    response: {
+      ok: true,
+      authority: {
+        schemaVersion: 2,
+        ownedSchemaDigest: digest,
+        expectedOwnedSchemaDigest: digest
+      }
+    },
+    report: "evidence/migration-compatibility.json",
+    raw: "evidence/migration-compatibility.raw"
+  });
+  assert.equal(validMigration.status, 0, validMigration.stderr);
+  assert.equal(validMigration.reportExists, true);
+
+  const malformedReadiness = runPrecheck({
+    checkId: "readiness-precondition-precheck",
+    response: { ok: true, lifecycle: "ready" },
+    report: "evidence/readiness-precheck.json",
+    raw: "evidence/readiness-precheck.raw"
+  });
+  assert.notEqual(malformedReadiness.status, 0, malformedReadiness.stderr);
+  assert.equal(malformedReadiness.rawExists, true);
+  assert.equal(malformedReadiness.reportExists, false);
+
+  const validReadiness = runPrecheck({
+    checkId: "readiness-precondition-precheck",
+    response: {
+      ok: true,
+      lifecycle: "ready",
+      authority: { journalMode: "delete", schemaVersion: 2 },
+      workers: { instanceLease: { state: "healthy" } }
+    },
+    report: "evidence/readiness-precheck.json",
+    raw: "evidence/readiness-precheck.raw"
+  });
+  assert.equal(validReadiness.status, 0, validReadiness.stderr);
+  assert.equal(validReadiness.reportExists, true);
 });
 
 interface DiagnosticRecord {
