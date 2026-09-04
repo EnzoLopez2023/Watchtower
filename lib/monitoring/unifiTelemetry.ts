@@ -7,7 +7,7 @@ function finiteNumber(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-const PRIMARY_WAN_KEY = "WAN";
+export const PRIMARY_WAN_KEY = "WAN";
 
 export function internetReachable(payload: Record<string, unknown>): boolean | null {
   const wan = payload.wan as Record<string, unknown> | null | undefined;

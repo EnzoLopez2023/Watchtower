@@ -73,6 +73,7 @@ test("infra status: a Sonarr-only agent failure requires stable samples", async 
       wan: { status: "up", _health: { www: { status: "ok" } } },
       devices: []
     });
+
     context.database
       .prepare("INSERT INTO protect_latest (id, received_at, payload) VALUES (1, ?, ?)")
       .run(NOW - 5_000, packJson({ cameras: [] }));
@@ -120,6 +121,46 @@ test("infra status: a Sonarr-only agent failure requires stable samples", async 
     assert.equal(agents.notificationPolicy?.failureSamples, 3);
     assert.equal(agents.notificationPolicy?.recoverySamples, 3);
     assert.equal(agents.notificationPolicy?.generationKey, JSON.stringify({ agents: NOW }));
+  } finally {
+    context.close();
+  }
+});
+
+test("infra status: a UniFi-only agent failure requires stable samples", async () => {
+  const context = harness("infra-unifi-confirmation");
+  try {
+    writeUnifiLatest(context.database, NOW - 6 * 60_000, {
+      wan: { status: "up", _health: { www: { status: "ok" } } },
+      devices: []
+    });
+    context.database
+      .prepare("INSERT INTO protect_latest (id, received_at, payload) VALUES (1, ?, ?)")
+      .run(NOW - 5_000, packJson({ cameras: [] }));
+    context.database
+      .prepare(
+        `INSERT INTO ups_readings (received_at, ups_id, ups_label, ups_status, raw)
+         VALUES (?, 'tower', 'Tower', 'OL', '{}')`
+      )
+      .run(NOW - 5_000);
+    context.database
+      .prepare(
+        `INSERT INTO agent_logs (agent, ts, level, message, received_at)
+         VALUES ('shutdown', ?, 'info', 'heartbeat', ?)`
+      )
+      .run(NOW - 5_000, NOW - 5_000);
+    context.database
+      .prepare(
+        `INSERT INTO synology_latest (nas_id, label, host, payload, received_at)
+         VALUES ('nas', 'NAS', NULL, ?, ?)`
+      )
+      .run(packJson({ disks: [], volumes: [] }), NOW - 5_000);
+
+    const agents = subsystem((await context.build(NOW)).subsystems, "agents");
+    assert.equal(agents.severity, "warn");
+    assert.equal(agents.detail, "UniFi Network not reporting");
+    assert.equal(agents.notificationPolicy?.signature, "UniFi Network");
+    assert.equal(agents.notificationPolicy?.failureSamples, 3);
+    assert.equal(agents.notificationPolicy?.recoverySamples, 3);
   } finally {
     context.close();
   }

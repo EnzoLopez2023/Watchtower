@@ -12,6 +12,7 @@ import type {
 } from "../db/repositories/watchtower/outageRepository.js";
 import { packJson, unpackJson } from "./payloadCodec.js";
 import { asText } from "./values.js";
+import { PRIMARY_WAN_KEY } from "./unifiTelemetry.js";
 
 const DEFAULT_SCOPE = "home";
 const DEFAULT_RECOVERY_HOLD_MS = 7 * 60 * 1000;
@@ -259,12 +260,16 @@ async function syncWanEvidence(repo: OutageRepository, now: number): Promise<{ i
     repo,
     "unifi-readings",
     (ctx, lastRowId, limit) => ctx.loadUnifiReadings(lastRowId, limit) as unknown as Array<Record<string, unknown>>,
-    (ctx, rows, sourceState) => {
-      let inserted = insertTransitionRows(ctx, rows, {
+    (ctx, rows, sourceState) =>
+      insertTransitionRows(ctx, rows, {
         keyPrefix: "unifi-wan",
         source: () => "unifi:wan-reachability",
         signal: () => "internet",
-        state: (row) => (((row as unknown) as UnifiReadingRow).internet_reachable === 0 ? "outage" : "healthy"),
+        state: (row) => {
+          const reachable = ((row as unknown) as UnifiReadingRow).internet_reachable;
+          if (reachable == null) return null;
+          return reachable === 0 ? "outage" : "healthy";
+        },
         confidence: () => "high",
         summary: (_row, state) =>
           state === "outage"
@@ -276,6 +281,43 @@ async function syncWanEvidence(repo: OutageRepository, now: number): Promise<{ i
             r.active_wan_name ?? r.active_wan,
             r.wan_latency_ms == null ? null : `${Math.round(r.wan_latency_ms)} ms`,
           ].filter(Boolean).join(" · ") || null;
+        },
+        raw: (row) => row,
+        refreshAfterMs: AGENT_FRESHNESS.unifi.staleAfterMs,
+      }, sourceState),
+    now
+  );
+}
+
+async function syncWanFailoverEvidence(
+  repo: OutageRepository,
+  now: number
+): Promise<{ inserted: number; hasMore: boolean }> {
+  return processEvidenceStream(
+    repo,
+    "unifi-failover-readings",
+    (ctx, lastRowId, limit) =>
+      ctx.loadUnifiFailoverReadings(lastRowId, limit) as unknown as Array<Record<string, unknown>>,
+    (ctx, rows, sourceState) => {
+      let inserted = insertTransitionRows(ctx, rows, {
+        keyPrefix: "unifi-failover",
+        source: () => "unifi:wan-failover",
+        signal: () => "internet",
+        state: (row) => {
+          const activeWan = ((row as unknown) as UnifiReadingRow).active_wan;
+          if (!activeWan) return null;
+          return activeWan === PRIMARY_WAN_KEY ? "healthy" : "outage";
+        },
+        confidence: () => "high",
+        summary: (row, state) => {
+          const r = (row as unknown) as UnifiReadingRow;
+          return state === "outage"
+            ? `WAN failover routed traffic through ${r.active_wan_name ?? r.active_wan}`
+            : "Primary WAN routing restored";
+        },
+        detail: (row) => {
+          const r = (row as unknown) as UnifiReadingRow;
+          return r.active_wan_name ?? r.active_wan;
         },
         raw: (row) => row,
         refreshAfterMs: AGENT_FRESHNESS.unifi.staleAfterMs,
@@ -429,7 +471,11 @@ export function classifyOutageSignals(signals: EvidenceSignal[]): ClassifyResult
     });
   }
 
-  const wan = active.filter((s) => s.source === "unifi:wan-reachability");
+  const wan = active.filter(
+    (s) =>
+      s.source === "unifi:wan-reachability" ||
+      s.source === "unifi:wan-failover"
+  );
   if (wan.length) {
     serviceCandidates.push({
       classification: "internet",
@@ -481,31 +527,6 @@ export function classifyOutageSignals(signals: EvidenceSignal[]): ClassifyResult
     };
   }
 
-  const collectors = active.filter((s) => s.signal === "collector");
-  const collectorHealthy = signals.filter((s) => s.signal === "collector" && s.state === "healthy");
-  if (collectors.length === 1 && collectorHealthy.length) {
-    return {
-      classification: "collector_down",
-      confidence: "high",
-      evidence: collectors,
-      startedAt: collectors[0]!.occurred_at,
-      classifications: ["collector_down"],
-      confidenceByClassification: { collector_down: "high" },
-      evidenceByClassification: { collector_down: collectors },
-    };
-  }
-  if (collectors.length) {
-    const conf: Confidence = collectors.length > 1 ? "medium" : "low";
-    return {
-      classification: "unknown",
-      confidence: conf,
-      evidence: collectors,
-      startedAt: Math.min(...collectors.map((s) => s.occurred_at)),
-      classifications: ["unknown"],
-      confidenceByClassification: { unknown: conf },
-      evidenceByClassification: { unknown: collectors },
-    };
-  }
   return null;
 }
 
@@ -718,14 +739,9 @@ export function buildIncidentSegments(
   now: number,
   recoveryHoldMs = DEFAULT_RECOVERY_HOLD_MS
 ): IncidentSegment[] {
-  const service = buildLaneSegments(evidence, now, recoveryHoldMs, (scope) => scope, true);
-  const collector = buildLaneSegments(
-    evidence.filter((item) => item.signal === "collector"),
-    now,
-    recoveryHoldMs,
-    (scope) => `${scope}:collectors`
-  );
-  return [...service, ...collector].sort((a, b) => a.startedAt - b.startedAt);
+  // Collector freshness controls whether service evidence can be trusted, but
+  // reduced monitoring visibility is not itself a power or WAN outage.
+  return buildLaneSegments(evidence, now, recoveryHoldMs, (scope) => scope, true);
 }
 
 function parseClassifications(value: string | null | undefined): Classification[] {
@@ -790,6 +806,7 @@ function sourceLabels(evidence: EvidenceRow[]): string[] {
         .map((item) => {
           if (item.signal === "power") return "UPS power telemetry";
           if (item.source === "unifi:wan-reachability") return "UniFi WAN reachability";
+          if (item.source === "unifi:wan-failover") return "UniFi WAN failover";
           if (item.source.includes(":external:")) return "independent external probes";
           if (item.source.includes(":dns:")) return "independent DNS probes";
           if (item.source.includes(":http:")) return "independent HTTP probes";
@@ -809,8 +826,13 @@ function reportCause(
     return "UPS telemetry confirms loss of utility input. Retained evidence does not identify the upstream utility cause.";
   }
   if (classification === "internet") {
-    const wan = evidence.some(
-      (item) => item.state === "outage" && item.source === "unifi:wan-reachability"
+    const wanReachability = evidence.some(
+      (item) =>
+        item.state === "outage" &&
+        item.source === "unifi:wan-reachability"
+    );
+    const failover = evidence.some(
+      (item) => item.state === "outage" && item.source === "unifi:wan-failover"
     );
     const independent = evidence.some(
       (item) =>
@@ -819,13 +841,15 @@ function reportCause(
         (item.source.includes(":external:") || item.source.includes(":dns:"))
     );
     const basis =
-      wan && independent
+      wanReachability && independent
         ? "UniFi WAN reachability and independent probes confirm loss of internet reachability."
         : independent
           ? "Independent probes confirm loss of internet reachability."
-          : wan
+          : wanReachability
             ? "UniFi WAN reachability confirms loss of internet reachability."
-            : "Retained network telemetry confirms loss of internet reachability.";
+            : failover
+              ? "UniFi routing telemetry confirms traffic failed over from the primary WAN."
+              : "Retained network telemetry confirms a WAN service event.";
     return `${basis} Retained evidence does not identify the provider-side physical cause.`;
   }
   if (classification === "collector_down") {
@@ -857,6 +881,15 @@ export function buildPostmortemReport(
   );
   const includesPower = classifications.includes("power");
   const includesInternet = classifications.includes("internet");
+  const includesWanFailover = evidence.some(
+    (item) => item.state === "outage" && item.source === "unifi:wan-failover"
+  );
+  const includesReachabilityLoss = evidence.some(
+    (item) =>
+      item.state === "outage" &&
+      causalInternetSources.has(item.source) &&
+      item.source !== "unifi:wan-failover"
+  );
   const directServiceRecovery =
     (!includesPower || powerRestoredAt != null) &&
     (!includesInternet || internetRestoredAt != null);
@@ -866,11 +899,15 @@ export function buildPostmortemReport(
     : "A healthy source transition reduced evidence below the outage threshold; direct recovery was not observed for every causal source.";
   const executiveSummary = [
     includesPower && includesInternet
-      ? "A power interruption and an internet interruption occurred within one compound incident."
+      ? includesReachabilityLoss
+        ? "A power interruption and an internet interruption occurred within one compound incident."
+        : "A power interruption and a WAN failover occurred within one compound incident."
       : includesPower
         ? "A power interruption affected the home infrastructure."
         : includesInternet
-          ? "An internet interruption affected external connectivity."
+          ? includesReachabilityLoss
+            ? "An internet interruption affected external connectivity."
+            : "A WAN failover moved routing away from the primary uplink."
           : incident.classification === "collector_down"
             ? "A telemetry collector stopped reporting while independent evidence remained healthy."
             : "Monitoring recorded an outage that could not be classified more specifically.",
@@ -892,7 +929,9 @@ export function buildPostmortemReport(
       classification: cls,
       summary:
         cls === "internet"
-          ? "Internet reachability was impaired during the same incident."
+          ? includesReachabilityLoss
+            ? "Internet reachability was impaired during the same incident."
+            : "WAN failover occurred during the same incident."
           : cls === "collector_down"
             ? "A collector reporting gap occurred during the incident."
             : "Additional outage evidence was observed during the incident.",
@@ -909,11 +948,17 @@ export function buildPostmortemReport(
     impact: {
       summary:
         includesPower && includesInternet
-          ? "Utility-powered infrastructure transferred to battery protection and external connectivity was unavailable."
+          ? includesReachabilityLoss
+            ? "Utility-powered infrastructure transferred to battery protection and external connectivity was unavailable."
+            : "Utility-powered infrastructure transferred to battery protection while routing failed over to a backup WAN."
           : includesPower
             ? "Utility-powered infrastructure transferred to battery protection."
             : includesInternet
-              ? "External connectivity was unavailable."
+              ? includesReachabilityLoss
+                ? "External connectivity was unavailable."
+                : includesWanFailover
+                  ? "Traffic remained routed through a backup WAN until the primary uplink recovered."
+                  : "A WAN service event was confirmed."
               : incident.classification === "collector_down"
                 ? "Monitoring visibility was reduced; independent service evidence did not prove a service outage."
                 : "The affected service scope could not be established from retained evidence.",
@@ -1267,8 +1312,9 @@ export async function runOutagePostmortemCycle(repo: OutageRepository, now = Dat
   try {
     const upsResult = await syncUpsEvidence(repo, now);
     const wanResult = await syncWanEvidence(repo, now);
+    const wanFailoverResult = await syncWanFailoverEvidence(repo, now);
     const probeResult = await syncProbeEvidence(repo, now);
-    const streamResults = [upsResult, wanResult, probeResult];
+    const streamResults = [upsResult, wanResult, wanFailoverResult, probeResult];
     const evidenceInserted =
       streamResults.reduce((sum, r) => sum + r.inserted, 0) +
       await syncCollectorEvidence(repo, now);

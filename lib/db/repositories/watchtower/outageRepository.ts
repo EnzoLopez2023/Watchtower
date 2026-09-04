@@ -38,6 +38,7 @@ export interface OutageRepository {
   cancelPendingReadyNotification(id: string): Promise<void>;
   loadUpsReadings(lastRowId: number, limit: number): Promise<UpsReadingRow[]>;
   loadUnifiReadings(lastRowId: number, limit: number): Promise<UnifiReadingRow[]>;
+  loadUnifiFailoverReadings(lastRowId: number, limit: number): Promise<UnifiReadingRow[]>;
   loadProbeSamples(lastRowId: number, limit: number): Promise<ProbeSampleRow[]>;
   getUnifiLatest(): Promise<CollectorFreshnessRow | undefined>;
   getNetworkObserverLatest(): Promise<CollectorFreshnessRow | undefined>;
@@ -90,6 +91,7 @@ export interface SyncOutageRepoContext {
   cancelPendingReadyNotification(id: string): void;
   loadUpsReadings(lastRowId: number, limit: number): UpsReadingRow[];
   loadUnifiReadings(lastRowId: number, limit: number): UnifiReadingRow[];
+  loadUnifiFailoverReadings(lastRowId: number, limit: number): UnifiReadingRow[];
   loadProbeSamples(lastRowId: number, limit: number): ProbeSampleRow[];
   getUnifiLatest(): CollectorFreshnessRow | undefined;
   getNetworkObserverLatest(): CollectorFreshnessRow | undefined;
@@ -392,6 +394,10 @@ export class SqliteOutageRepository extends SqliteRepository implements OutageRe
 
   public async loadUnifiReadings(lastRowId: number, limit: number): Promise<UnifiReadingRow[]> {
     return this.syncContext.loadUnifiReadings(lastRowId, limit);
+  }
+
+  public async loadUnifiFailoverReadings(lastRowId: number, limit: number): Promise<UnifiReadingRow[]> {
+    return this.syncContext.loadUnifiFailoverReadings(lastRowId, limit);
   }
 
   public async loadProbeSamples(lastRowId: number, limit: number): Promise<ProbeSampleRow[]> {
@@ -706,6 +712,15 @@ export class SqliteOutageRepository extends SqliteRepository implements OutageRe
         `SELECT id, received_at, device_ts, internet_reachable, active_wan, active_wan_name,
                 wan_latency_ms
            FROM unifi_readings WHERE id > ? AND internet_reachable IS NOT NULL ORDER BY id LIMIT ?`,
+        lastRowId,
+        limit
+      ),
+
+    loadUnifiFailoverReadings: (lastRowId, limit) =>
+      this.all<UnifiReadingRow>(
+        `SELECT id, received_at, device_ts, internet_reachable, active_wan, active_wan_name,
+                wan_latency_ms
+           FROM unifi_readings WHERE id > ? AND active_wan IS NOT NULL ORDER BY id LIMIT ?`,
         lastRowId,
         limit
       ),

@@ -263,8 +263,8 @@ test("alert engine: the network observer needs three identical samples to confir
   }
 });
 
-test("alert engine: a Sonarr-only agents flap needs three samples in each direction", async () => {
-  const harness = createEngine("alert-agents-sonarr");
+test("alert engine: transient UniFi gaps stay silent while sustained failure and recovery notify", async () => {
+  const harness = createEngine("alert-agents-unifi");
   try {
     const agents = (severity: "ok" | "warn", generation: number): Subsystem =>
       tile({
@@ -272,14 +272,14 @@ test("alert engine: a Sonarr-only agents flap needs three samples in each direct
         label: "On-site Agents",
         severity,
         headline: severity === "warn" ? "1 silent" : "7 reporting",
-        detail: severity === "warn" ? "Sonarr not reporting" : "All agents reporting",
+        detail: severity === "warn" ? "UniFi Network not reporting" : "All agents reporting",
         escalation: severity === "warn" ? 1 : 0,
         notificationPolicy: {
           kind: "consecutive-samples",
           sampleKey: String(generation),
           generationKey: JSON.stringify({ agents: generation }),
-          signature: severity === "warn" ? "Sonarr" : "all-reporting",
-          failureSamples: severity === "warn" ? 3 : 1,
+          signature: severity === "warn" ? "UniFi Network" : "all-reporting",
+          failureSamples: 3,
           recoverySamples: 3
         }
       });
@@ -298,8 +298,8 @@ test("alert engine: a Sonarr-only agents flap needs three samples in each direct
       harness.setStatus(payload([agents("warn", generation)]));
       await harness.engine.run();
     }
-    assert.equal(harness.sent.length, 1, "three Sonarr failures confirm the warning");
-    assert.match(harness.sent[0]?.body ?? "", /Sonarr not reporting/);
+    assert.equal(harness.sent.length, 1, "three UniFi failures confirm the warning");
+    assert.match(harness.sent[0]?.body ?? "", /UniFi Network not reporting/);
 
     harness.setStatus(payload([agents("ok", 6)]));
     await harness.engine.run();

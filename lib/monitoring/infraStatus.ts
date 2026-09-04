@@ -810,8 +810,8 @@ function agentAgo(now: number, ms: number | null): string | null {
  *
  * Sonarr is not an owned collector any more: its liveness comes from the Marquee
  * media-health contract, and an unreachable contract is reported as unknown
- * rather than assumed healthy. A Sonarr-only failure is confirmation-gated because
- * Marquee cold starts can briefly publish it as absent; owned-agent failures remain
+ * rather than assumed healthy. Noncritical silence is confirmation-gated because
+ * brief collector and contract gaps are expected; the shutdown watchdog remains
  * immediate, and recoveries must remain stable before they are announced.
  */
 async function agentsStatus(
@@ -861,7 +861,6 @@ async function agentsStatus(
 
   const silentLabels = [...staleOnes.map((check) => check.label)];
   if (sonarrSilent) silentLabels.push(sonarrPolicy.label);
-  const sonarrOnlySilent = sonarrSilent && staleOnes.length === 0;
 
   const agents: AgentUnit[] = checks.map((check) => ({
     id: check.label,
@@ -907,7 +906,7 @@ async function agentsStatus(
       sampleKey: String(now),
       generationKey: JSON.stringify({ agents: now }),
       signature: silentLabels.length ? silentLabels.join("|") : "all-reporting",
-      failureSamples: sonarrOnlySilent ? AGENT_ALERT_CONFIRMATION_SAMPLES : 1,
+      failureSamples: criticalStale.length ? 1 : AGENT_ALERT_CONFIRMATION_SAMPLES,
       recoverySamples: AGENT_ALERT_CONFIRMATION_SAMPLES
     }
   };

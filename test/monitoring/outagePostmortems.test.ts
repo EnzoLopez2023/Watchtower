@@ -66,7 +66,7 @@ test("classification prioritizes real power and internet evidence over collector
   assert.deepEqual(result?.classifications, ["power", "internet"]);
 });
 
-test("classification requires corroboration and distinguishes collector_down from unknown", () => {
+test("classification requires service evidence and ignores collector-only gaps", () => {
   const internet = classifyOutageSignals([
     signal({ source: "observer:hpz4g4:external:cloudflare" }),
     signal({ source: "observer:hpz4g4:external:google", occurred_at: 2_000 }),
@@ -79,15 +79,13 @@ test("classification requires corroboration and distinguishes collector_down fro
     signal({ source: "collector:unifi", signal: "collector" }),
     signal({ source: "collector:network-observer", signal: "collector", state: "healthy" }),
   ]);
-  assert.equal(collectorDown?.classification, "collector_down");
-  assert.equal(collectorDown?.confidence, "high");
+  assert.equal(collectorDown, null);
 
   const unknown = classifyOutageSignals([
     signal({ source: "collector:unifi", signal: "collector" }),
     signal({ source: "collector:network-observer", signal: "collector" }),
   ]);
-  assert.equal(unknown?.classification, "unknown");
-  assert.equal(unknown?.confidence, "medium");
+  assert.equal(unknown, null);
 });
 
 test("recovery hold merges regression and finalizes only after stability", () => {
@@ -133,13 +131,125 @@ test("collector gaps remain isolated from power and internet incident timing", (
   ];
   const segments = buildIncidentSegments(evidence, 1_500, 400);
   const internet = segments.find((s) => s.classification === "internet");
-  const collector = segments.find((s) => s.classification === "collector_down");
+  const collector = segments.find((s) => s.scope === "home:collectors");
   assert.equal(internet?.startedAt, 200);
   assert.equal(internet?.recoveredAt, 300);
   assert.deepEqual(internet?.classifications, ["internet"]);
-  assert.equal(collector?.startedAt, 100);
-  assert.equal(collector?.recoveredAt, 900);
-  assert.equal(collector?.scope, "home:collectors");
+  assert.equal(collector, undefined);
+});
+
+test("short collector silence with healthy independent evidence never creates an outage report", async () => {
+  const base = Date.now();
+  db.prepare("INSERT INTO unifi_latest (id, received_at, payload) VALUES (1, ?, '{}')")
+    .run(base - 6 * 60_000);
+  db.prepare(
+    "INSERT INTO network_observer_latest (observer_id, received_at, payload) VALUES ('observer', ?, '{}')"
+  ).run(base);
+
+  await runOutagePostmortemCycle(repo, base);
+  db.prepare("UPDATE unifi_latest SET received_at = ? WHERE id = 1").run(base + 60_000);
+  await runOutagePostmortemCycle(repo, base + 60_000);
+  db.prepare("UPDATE unifi_latest SET received_at = ? WHERE id = 1").run(base + 9 * 60_000);
+  db.prepare("UPDATE network_observer_latest SET received_at = ? WHERE observer_id = 'observer'")
+    .run(base + 9 * 60_000);
+  await runOutagePostmortemCycle(repo, base + 9 * 60_000);
+
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS n FROM outage_incident_evidence WHERE signal = 'collector'")
+      .get() as { n: number }).n,
+    3
+  );
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS n FROM outage_incidents").get() as { n: number }).n,
+    0
+  );
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS n FROM outage_postmortems").get() as { n: number }).n,
+    0
+  );
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS n FROM mobile_alert_events WHERE id LIKE 'postmortem:%'")
+      .get() as { n: number }).n,
+    0
+  );
+});
+
+test("power loss still qualifies for an outage post-mortem", async () => {
+  const base = Date.now();
+  const insert = db.prepare(
+    "INSERT INTO ups_readings (received_at, device_ts, ups_id, ups_label, ups_status) VALUES (?, ?, 'tower', 'UPS Tower', ?)"
+  );
+  insert.run(base, base, "OB");
+  insert.run(base + 1_000, base + 1_000, "OL");
+
+  await runOutagePostmortemCycle(repo, base + 62_000);
+
+  const incident = db.prepare(
+    "SELECT classification, status FROM outage_incidents"
+  ).get() as { classification: string; status: string } | undefined;
+  assert.deepEqual(incident, { classification: "power", status: "finalized" });
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS n FROM outage_postmortems").get() as { n: number }).n,
+    1
+  );
+});
+
+test("WAN reachability loss still qualifies as an internet outage", async () => {
+  const base = Date.now();
+  const insert = db.prepare(
+    `INSERT INTO unifi_readings (
+       received_at, device_ts, internet_reachable, active_wan, active_wan_name
+     ) VALUES (?, ?, ?, ?, ?)`
+  );
+  insert.run(base, base, 1, "WAN", "Fiber");
+  insert.run(base + 1_000, base + 1_000, 0, "WAN", "Fiber");
+  insert.run(base + 2_000, base + 2_000, 1, "WAN", "Fiber");
+
+  await runOutagePostmortemCycle(repo, base + 63_000);
+
+  const incidents = db.prepare(
+    "SELECT classification, status FROM outage_incidents ORDER BY started_at"
+  ).all() as Array<{ classification: string; status: string }>;
+  assert.deepEqual(incidents, [
+    { classification: "internet", status: "finalized" },
+  ]);
+  const evidence = db.prepare(
+    "SELECT source, state FROM outage_incident_evidence WHERE incident_id IS NOT NULL ORDER BY occurred_at, id"
+  ).all() as Array<{ source: string; state: string }>;
+  assert.ok(evidence.some((row) => row.source === "unifi:wan-reachability" && row.state === "outage"));
+});
+
+test("routed WAN failover qualifies without claiming connectivity loss", async () => {
+  const base = Date.now();
+  const insert = db.prepare(
+    `INSERT INTO unifi_readings (
+       received_at, device_ts, internet_reachable, active_wan, active_wan_name
+     ) VALUES (?, ?, NULL, ?, ?)`
+  );
+  insert.run(base, base, "WAN", "Fiber");
+  insert.run(base + 1_000, base + 1_000, "WAN2", "Cable");
+  insert.run(base + 2_000, base + 2_000, "WAN", "Fiber");
+  const lastRowId = (db.prepare("SELECT MAX(id) AS id FROM unifi_readings").get() as { id: number }).id;
+  db.prepare(
+    `INSERT INTO outage_evidence_cursors (stream, last_row_id, source_state, updated_at)
+     VALUES ('unifi-readings', ?, '{}', ?)`
+  ).run(lastRowId, base + 2_000);
+
+  await runOutagePostmortemCycle(repo, base + 63_000);
+
+  const incident = db.prepare(
+    `SELECT i.classification, i.status, p.executive_summary
+       FROM outage_incidents i
+       JOIN outage_postmortems p ON p.incident_id = i.id`
+  ).get() as {
+    classification: string;
+    status: string;
+    executive_summary: string;
+  } | undefined;
+  assert.equal(incident?.classification, "internet");
+  assert.equal(incident?.status, "finalized");
+  assert.match(incident?.executive_summary ?? "", /WAN failover/);
+  assert.doesNotMatch(incident?.executive_summary ?? "", /external connectivity|internet interruption/i);
 });
 
 test("a stale observer invalidates its failed probes without keeping internet open", () => {
